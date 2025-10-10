@@ -17,7 +17,7 @@ Before running the program, you need to configure the `system_config.yaml` file 
 - `QUERY_NUMBER`: Limits the size of the dataset. Here, it's set to `500`, meaning it will process up to 200 data points.
 - `TOPN_ITEMS`: Number of top items returned, set to `500`.
 - `TOPK_ITEMS`: The number of top K items selected, set to `10`.
-- `DOMAIN`: The data domain being used. Options include `"amazon_clothing"`, `"amazon_beauty"`, and `"kdd22"`. The default is set to `"kdd22"`.
+- `DOMAIN`: The data domain being used. Options include `"amazon_clothing"`, `"amazon_beauty"`, and `"amazon_music"`. The default is set to `"amazon_clothing"`.
 - `MODEL`: Specifies the model to be used. The default model is `"gpt-4o"`, but you can switch to other models such as `"claude-3-5-sonnet"` or `"qwen-plus"`.
 - `METHOD`: The method being used. In this case, it's set to `TAIRA`.
 - `OPENAI_BASE_URL` and `OPENAI_API_KEY`: These fields are for configuring access to the OpenAI API. Make sure to provide your valid OpenAI API key. If you need to use a model other than openai, please set the corresponding base_url and api_key.
