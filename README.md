@@ -68,7 +68,6 @@ Before running the program, you need to configure the `system_config.yaml` file 
 - `GOOGLE_API_KEY` and `GOOGLE_CSE_ID`: These are for Google API configurations in Searcher Agent.
 
 Ensure you have a valid OpenAI API key set up in the `OPENAI_API_KEY` field for the program to work properly.
-<p id="Run"></p>  
 ## 🏃 Usage
 
 To start the interactive recommendation simulation and evaluation:
