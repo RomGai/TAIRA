@@ -5,7 +5,7 @@
 
 **Thought-Augmented Planning for LLM-Powered Interactive Recommender Agent** *Proceedings of the 32nd ACM SIGKDD Conference on Knowledge Discovery and Data Mining (KDD '26)*
 
-[Haocheng Yu](https://github.com/Alcein), [Yaxiong Wu](mailto:wu.yaxiong@huawei.com), [Hao Wang](mailto:wanghao3@ustc.edu.cn), Wei Guo, Yong Liu, Yawen Li, Yuyang Ye, Junping Du, and Enhong Chen.
+Haocheng Yu, Yaxiong Wu, Hao Wang, Wei Guo, Yong Liu, Yawen Li, Yuyang Ye, Junping Du, and Enhong Chen.
 
 ---
 
