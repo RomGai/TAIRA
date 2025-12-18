@@ -16,3 +16,5 @@ OPENAI_API_KEY: "sk-"
 
 GOOGLE_API_KEY: ""
 GOOGLE_CSE_ID: ""
+# Enable pattern learning from execution (Thought Pattern Distillation)
+ENABLE_LEARNING: false  # Set to true to enable automatic pattern learning

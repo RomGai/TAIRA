@@ -1,13 +1,57 @@
-<h1>Thought-Augmented Planning for LLM-Powered Interactive Recommender Agent</h1>
+# TAIRA: Thought-Augmented Planning for LLM-Powered Interactive Recommender Agent
 
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.12+-yellow.svg)](https://www.python.org/)
 
-## ⚙    Preparations
-Set up a virtualenv and install the [pytorch](https://pytorch.org/get-started/previous-versions/) manually. After that, install all the dependencies listed in the `requirements.txt` file by running the following command:
+**Thought-Augmented Planning for LLM-Powered Interactive Recommender Agent** *Proceedings of the 32nd ACM SIGKDD Conference on Knowledge Discovery and Data Mining (KDD '26)*
 
-```bash
-pip install -r requirements.txt
-```
-Our experiments have been tested on **Python 3.12.7**.
+[Haocheng Yu](https://github.com/Alcein), [Yaxiong Wu](mailto:wu.yaxiong@huawei.com), [Hao Wang](mailto:wanghao3@ustc.edu.cn), Wei Guo, Yong Liu, Yawen Li, Yuyang Ye, Junping Du, and Enhong Chen.
+
+---
+
+## 📖 Introduction
+
+Interactive recommender systems (IRS) allow users to express needs via natural language. However, existing LLM-powered agents often struggle with **complex, unrefined, or ambiguous user intents** due to limited planning and generalization capabilities.
+
+We propose **TAIRA** (Thought-Augmented Interactive Recommender Agent), a novel multi-agent system designed to handle complex user intents through:
+1.  **Thought Pattern Distillation (TPD):** A mechanism that distills high-level reasoning patterns from both successful agent trajectories and expert-corrected failures.
+2.  **Hierarchical Planning:** A manager agent orchestrates tasks by decomposing user needs and dynamically updating plans based on execution feedback.
+3.  **Generalization:** Leveraging distilled thought patterns to solve novel tasks effectively.
+
+<p align="center">
+  <img src="assets/intro.png" alt="TAIRA Introduction Scenario" width="80%">
+  <br>
+  <em>Figure 1: Examples of recommendation involving diverse and complex user intent and thought-augmentation with past experiences.</em>
+</p>
+
+## 🚀 Framework Architecture
+
+TAIRA operates as a multi-agent system featuring a **Manager Agent** that orchestrates specialized **Executor Agents** (Searcher, Item Retriever, etc.). The system continuously learns and refines its planning capabilities through the **Thought Pattern Distillation** module.
+
+<p align="center">
+  <img src="assets/architecture.png" alt="TAIRA System Architecture" width="95%">
+  <br>
+  <em>Figure 2: The overall architecture of TAIRA, illustrating the Manager Agent's planning process, Executor Agents, and the TPD mechanism.</em>
+</p>
+
+## 🛠️ Installation
+
+### Prerequisites
+* Python 3.12.7 or higher
+* PyTorch (Check [official site](https://pytorch.org/get-started/locally/) for your CUDA version)
+
+### Setup
+1.  Clone the repository:
+    ```bash
+    git clone [https://github.com/Alcein/TAIRA.git](https://github.com/Alcein/TAIRA.git)
+    cd TAIRA
+    ```
+
+2.  Install dependencies:
+    ```bash
+    pip install -r requirements.txt
+    ```
+
 ## ⚙️ Configuration (`system_config.yaml`)
 
 Before running the program, you need to configure the `system_config.yaml` file based on your specific requirements.
@@ -25,21 +69,11 @@ Before running the program, you need to configure the `system_config.yaml` file 
 
 Ensure you have a valid OpenAI API key set up in the `OPENAI_API_KEY` field for the program to work properly.
 <p id="Run"></p>  
+## 🏃 Usage
 
-## Running the Program
-
-Once the configuration is set, you can run the main program with the following command:
+To start the interactive recommendation simulation and evaluation:
 
 ```bash
 python main.py
 ```
-### Description:
-- This command will execute the program based on the configurations defined in `system_config.yaml`.
-- Ensure you have an active internet connection and valid API keys configured for proper operation.
-
-
-[//]: # (## 💰 Simulation Cost)
-
-[//]: # (🛎️ Note that all the experiments are powered by ChatGPT-3.5, and a complete simulation involving 1000 users would cost approximately $16. &#40;$0.016/User&#41;)
-
 

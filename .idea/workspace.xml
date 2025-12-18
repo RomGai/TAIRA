@@ -5,42 +5,27 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="e122b811-1097-4068-9a90-6e02a4419be0" name="变更" comment="">
-      <change afterPath="$PROJECT_DIR$/data/amazon_beauty/metadata.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_beauty/query_data1.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_beauty/user_profile.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_clothing/knowledge1.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_clothing/query_data1.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_clothing/user_profile.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_music/knowledge1.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_music/metadata.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_music/query_data1.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/amazon_music/user_profile.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/executor_agents/pattern_creator.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/user_simulate/evaluate_agent.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/amazon_beauty/metadata.parquet" beforeDir="false" afterPath="$PROJECT_DIR$/data/amazon_clothing/metadata.csv" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/amazon_beauty/query_data1.parquet" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/amazon_clothing/knowledge1.parquet" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/amazon_clothing/metadata.parquet" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/amazon_clothing/query_data1.parquet" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/kdd22/query_data1.parquet" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/executor_agents/agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/executor_agents/agent.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/executor_agents/evaluate_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/executor_agents/evaluate_agent.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/executor_agents/item_retrieval_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/executor_agents/item_retrieval_agent.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/executor_agents/searcher.py" beforeDir="false" afterPath="$PROJECT_DIR$/executor_agents/searcher.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/executor_agents/__init__.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/executor_agents/agent.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/executor_agents/evaluate_agent.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/executor_agents/interact_agent.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/executor_agents/item_retrieval_agent.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/executor_agents/pattern_creator.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/executor_agents/searcher.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/executor_agents/task_interpreter.py" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/manager.py" beforeDir="false" afterPath="$PROJECT_DIR$/manager.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/system_config.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/system_config.yaml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/Prompts.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/Prompts.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/task.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/task.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/thought_template.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/thought_template.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="EmbeddingIndexingInfo">
+    <option name="cachedIndexableFilesCount" value="64" />
+    <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
   </component>
   <component name="FileTemplateManagerImpl">
     <option name="RECENT_TEMPLATES">
@@ -52,26 +37,25 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
-  "lastFilter": {
-    "state": "OPEN",
-    "assignee": "Alcein"
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;Alcein&quot;
   }
-}]]></component>
-  <component name="GithubPullRequestsUISettings"><![CDATA[{
-  "selectedUrlAndAccountId": {
-    "url": "https://github.com/Alcein/TAIRA.git",
-    "accountId": "0033e35a-489f-4e92-89c2-29037f96e94a"
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/Alcein/TAIRA.git&quot;,
+    &quot;accountId&quot;: &quot;5f0b26f9-7ca4-4f58-b86d-6d2416985c62&quot;
   }
-}]]></component>
+}</component>
   <component name="MarkdownSettingsMigration">
     <option name="stateVersion" value="1" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 8
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 8
+}</component>
   <component name="ProjectId" id="2nUzG7usmznIcaK50scHPLtaWk5" />
-  <component name="ProjectLevelVcsManager" settingsEditedManually="true" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
@@ -80,15 +64,22 @@
   "keyToString": {
     "RunOnceActivity.OpenProjectViewOnStart": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
     "WebServerToolWindowFactoryState": "true",
+    "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultAutoModeForALLUsers.v1": "true",
+    "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
     "git-widget-placeholder": "master",
-    "last_opened_file_path": "E:/Codes/TAIRA/TAIRA",
+    "junie.onboarding.icon.badge.shown": "true",
+    "last_opened_file_path": "/Users/yuhaoch/Documents/Code/TAIRA/assets",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
     "node.js.selected.package.tslint": "(autodetect)",
     "nodejs_package_manager_path": "npm",
-    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable",
+    "settings.editor.selected.configurable": "http.proxy",
+    "to.speed.mode.migration.done": "true",
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
@@ -108,8 +99,8 @@
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-js-predefined-1d06a55b98c1-0b3e54e931b4-JavaScript-PY-241.19416.19" />
-        <option value="bundled-python-sdk-337b0a7a993a-2767605e8bc2-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-241.19416.19" />
+        <option value="bundled-js-predefined-d6986cc7102b-c7e53b3be11b-JavaScript-PY-253.28294.336" />
+        <option value="bundled-python-sdk-0978a7220b69-9867c7d4c0a4-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-253.28294.336" />
       </set>
     </attachedChunks>
   </component>
@@ -128,6 +119,13 @@
       <workItem from="1729129295229" duration="2059000" />
       <workItem from="1729152349085" duration="981000" />
       <workItem from="1740304281009" duration="2589000" />
+      <workItem from="1766023673522" duration="758000" />
+      <workItem from="1766024498672" duration="185000" />
+      <workItem from="1766024734817" duration="48000" />
+      <workItem from="1766024798635" duration="851000" />
+      <workItem from="1766025682306" duration="989000" />
+      <workItem from="1766039946904" duration="648000" />
+      <workItem from="1766041266801" duration="1480000" />
     </task>
     <servers />
   </component>
