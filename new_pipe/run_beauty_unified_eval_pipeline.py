@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -105,6 +106,10 @@ def _safe_json_load(path: Path, default: Any) -> Any:
 def _save_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _result_key(row: Dict[str, Any]) -> str:
+    return f"{str(row.get('user_id', ''))}::{str(row.get('target_id', ''))}"
 
 
 def _route_query(query: str, category_catalog: List[str], enable_llm: bool, text_model: str) -> Dict[str, Any]:
@@ -308,10 +313,68 @@ def _print_cumulative_metrics(results: List[Dict[str, Any]]) -> None:
     if not results:
         return
     total = len(results)
-    hits = sum(int(r.get("hit", 0)) for r in results)
-    hr = hits / total
+    hr10 = float(np.mean([float(r.get("final_hr@10", 0.0)) for r in results]))
+    ndcg10 = float(np.mean([float(r.get("final_ndcg@10", 0.0)) for r in results]))
+    mrr10 = float(np.mean([float(r.get("final_mrr@10", 0.0)) for r in results]))
+    auc = float(np.mean([float(r.get("final_auc", 0.0)) for r in results]))
+    recall_hr10 = float(np.mean([float(r.get("recall_hr@10", 0.0)) for r in results]))
     avg_k = float(np.mean([float(r.get("used_k", 0)) for r in results]))
-    print(f"[Metrics] processed={total} hits={hits} hit_rate={hr:.4f} avg_used_k={avg_k:.1f}")
+    print(
+        "[Metrics] "
+        f"processed={total} "
+        f"Final(HR@10={hr10:.4f},NDCG@10={ndcg10:.4f},MRR@10={mrr10:.4f},AUC={auc:.4f}) "
+        f"Recall(HR@10={recall_hr10:.4f}) "
+        f"avg_used_k={avg_k:.1f}"
+    )
+
+
+def _auc_one_positive(scores: np.ndarray, positive_index: int) -> float:
+    pos_score = float(scores[positive_index])
+    neg_scores = np.delete(scores, positive_index)
+    if neg_scores.size == 0:
+        return 0.0
+    greater = float(np.sum(pos_score > neg_scores))
+    equal = float(np.sum(pos_score == neg_scores))
+    return (greater + 0.5 * equal) / float(neg_scores.size)
+
+
+def _ranking_metrics_at_10(target_idx: int, scores: np.ndarray) -> Dict[str, float]:
+    rank_indices = np.argsort(-scores)
+    rank_position = int(np.where(rank_indices == target_idx)[0][0]) + 1
+
+    hr10 = 1.0 if rank_position <= 10 else 0.0
+    ndcg10 = (1.0 / math.log2(rank_position + 1)) if rank_position <= 10 else 0.0
+    mrr10 = (1.0 / rank_position) if rank_position <= 10 else 0.0
+    auc = _auc_one_positive(scores=scores, positive_index=target_idx)
+    return {
+        "rank": float(rank_position),
+        "hr@10": hr10,
+        "ndcg@10": ndcg10,
+        "mrr@10": mrr10,
+        "auc": auc,
+    }
+
+
+def _ranking_metrics_from_ranked_items(
+    candidate_item_ids: List[str],
+    target_id: str,
+    ranked_items: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    if target_id not in candidate_item_ids:
+        return {"rank": float("inf"), "hr@10": 0.0, "ndcg@10": 0.0, "mrr@10": 0.0, "auc": 0.0}
+
+    score_map: Dict[str, float] = {}
+    for row in ranked_items:
+        iid = str(row.get("item_id", "")).strip()
+        if not iid:
+            continue
+        score_map[iid] = float(row.get("ranking_score", 0.0))
+
+    min_score = min(score_map.values()) if score_map else 0.0
+    fallback = min_score - 1.0
+    scores = np.array([score_map.get(iid, fallback) for iid in candidate_item_ids], dtype=np.float32)
+    target_idx = candidate_item_ids.index(target_id)
+    return _ranking_metrics_at_10(target_idx=target_idx, scores=scores)
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
@@ -324,6 +387,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError(f"No items loaded from filtered meta: {args.filtered_meta_jsonl}")
 
     all_item_ids = sorted(meta_map.keys())
+    all_item_id_to_idx = {iid: idx for idx, iid in enumerate(all_item_ids)}
     title_lower_map = {iid: str(meta_map[iid].get("title", "") or "").lower() for iid in all_item_ids}
 
     cache_dir = Path(args.cache_dir)
@@ -362,11 +426,30 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     vl_extractor = Qwen3VLExtractor(model_name=args.vl_model) if args.enable_vl_profiling else None
 
     category_catalog = sorted({_meta_category_text(v) for v in meta_map.values() if _meta_category_text(v)})
-    results: List[Dict[str, Any]] = []
+    results_path = Path(args.output_dir) / "unified_eval_results.json"
+    existing_results: List[Dict[str, Any]] = []
+    if args.include_existing_results and results_path.exists():
+        loaded = _safe_json_load(results_path, default=[])
+        if isinstance(loaded, list):
+            existing_results = [x for x in loaded if isinstance(x, dict)]
+            print(f"[Resume] loaded existing results: {len(existing_results)} from {results_path}")
+
+    dedup_existing: Dict[str, Dict[str, Any]] = {}
+    for row in existing_results:
+        k = _result_key(row)
+        if k and k != "::":
+            dedup_existing[k] = row
+    results: List[Dict[str, Any]] = list(dedup_existing.values())
+    processed_keys = set(dedup_existing.keys())
 
     for row_idx, row in query_df.iterrows():
         user_id = str(row["user_id"])
         target_id = str(row["id"])
+        key = f"{user_id}::{target_id}"
+        if key in processed_keys:
+            print(f"[Resume] skip existing user={user_id} target={target_id}")
+            continue
+
         query = str(row.get("new_query") or row.get("query") or "").strip()
         if not query:
             continue
@@ -381,6 +464,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
         sim_matrix = np.matmul(item_emb_norm, q_emb_norm[0])
         rank_indices = np.argsort(-sim_matrix)
+
+        if target_id in all_item_id_to_idx:
+            target_idx = all_item_id_to_idx[target_id]
+            recall_rank_metrics = _ranking_metrics_at_10(target_idx=target_idx, scores=sim_matrix)
+        else:
+            recall_rank_metrics = {"rank": float("inf"), "hr@10": 0.0, "ndcg@10": 0.0, "mrr@10": 0.0, "auc": 0.0}
 
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
         top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
@@ -402,7 +491,26 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         hit = target_id in top_ids
         if not hit:
             print("[Agent3] recall failed. metric=0, skip Agent1/2/4/5")
-            results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
+            results.append(
+                {
+                    "user_id": user_id,
+                    "target_id": target_id,
+                    "hit": 0,
+                    "used_k": used_k,
+                    "kw_debug": kw_debug,
+                    "recall_rank": recall_rank_metrics["rank"],
+                    "recall_hr@10": recall_rank_metrics["hr@10"],
+                    "recall_ndcg@10": recall_rank_metrics["ndcg@10"],
+                    "recall_mrr@10": recall_rank_metrics["mrr@10"],
+                    "recall_auc": recall_rank_metrics["auc"],
+                    "final_rank": float("inf"),
+                    "final_hr@10": 0.0,
+                    "final_ndcg@10": 0.0,
+                    "final_mrr@10": 0.0,
+                    "final_auc": 0.0,
+                }
+            )
+            processed_keys.add(key)
             _print_cumulative_metrics(results)
             continue
 
@@ -471,6 +579,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         }
 
         ranked_first = ""
+        final_rank_metrics = {"rank": float("inf"), "hr@10": 0.0, "ndcg@10": 0.0, "mrr@10": 0.0, "auc": 0.0}
         if args.enable_agent45:
             module3_out = run_module3(
                 intent_dual_recall_output=agent3_output,
@@ -480,8 +589,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 output_dir=args.output_dir,
             )
             ranked_first = module3_out.ranked_items[0]["item_id"] if module3_out.ranked_items else ""
+            final_rank_metrics = _ranking_metrics_from_ranked_items(
+                candidate_item_ids=top_ids,
+                target_id=target_id,
+                ranked_items=module3_out.ranked_items,
+            )
         else:
             print("[Agent4/5] skipped by --disable-agent45")
+            target_idx_in_top = top_ids.index(target_id)
+            top_scores = np.array([float(sim_matrix[all_item_id_to_idx[iid]]) for iid in top_ids], dtype=np.float32)
+            final_rank_metrics = _ranking_metrics_at_10(target_idx=target_idx_in_top, scores=top_scores)
 
         results.append({
             "user_id": user_id,
@@ -490,16 +607,39 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "used_k": used_k,
             "top1": ranked_first,
             "kw_debug": kw_debug,
+            "recall_rank": recall_rank_metrics["rank"],
+            "recall_hr@10": recall_rank_metrics["hr@10"],
+            "recall_ndcg@10": recall_rank_metrics["ndcg@10"],
+            "recall_mrr@10": recall_rank_metrics["mrr@10"],
+            "recall_auc": recall_rank_metrics["auc"],
+            "final_rank": final_rank_metrics["rank"],
+            "final_hr@10": final_rank_metrics["hr@10"],
+            "final_ndcg@10": final_rank_metrics["ndcg@10"],
+            "final_mrr@10": final_rank_metrics["mrr@10"],
+            "final_auc": final_rank_metrics["auc"],
         })
+        processed_keys.add(key)
         _print_cumulative_metrics(results)
 
     text_cache["items"] = item_sentence_cache
     text_cache["queries"] = query_sentence_cache
     _save_json(text_cache_path, text_cache)
-    _save_json(Path(args.output_dir) / "unified_eval_results.json", results)
+    _save_json(results_path, results)
 
     hit_rate = float(np.mean([r["hit"] for r in results])) if results else 0.0
-    summary = {"rows": len(results), "hit_rate": hit_rate, "output_dir": args.output_dir}
+    summary = {
+        "rows": len(results),
+        "hit_rate": hit_rate,
+        "final_hr@10": float(np.mean([float(r.get("final_hr@10", 0.0)) for r in results])) if results else 0.0,
+        "final_ndcg@10": float(np.mean([float(r.get("final_ndcg@10", 0.0)) for r in results])) if results else 0.0,
+        "final_mrr@10": float(np.mean([float(r.get("final_mrr@10", 0.0)) for r in results])) if results else 0.0,
+        "final_auc": float(np.mean([float(r.get("final_auc", 0.0)) for r in results])) if results else 0.0,
+        "recall_hr@10": float(np.mean([float(r.get("recall_hr@10", 0.0)) for r in results])) if results else 0.0,
+        "recall_ndcg@10": float(np.mean([float(r.get("recall_ndcg@10", 0.0)) for r in results])) if results else 0.0,
+        "recall_mrr@10": float(np.mean([float(r.get("recall_mrr@10", 0.0)) for r in results])) if results else 0.0,
+        "recall_auc": float(np.mean([float(r.get("recall_auc", 0.0)) for r in results])) if results else 0.0,
+        "output_dir": args.output_dir,
+    }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 
@@ -530,10 +670,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-llm-routing", action="store_true", help="开启Qwen3文本路由；默认关闭走规则fallback")
     parser.add_argument("--enable-vl-profiling", action="store_true", help="开启Qwen3-VL画像；默认关闭走轻量画像")
     parser.add_argument("--disable-agent45", action="store_true", help="关闭Agent4/5")
+    parser.add_argument(
+        "--ignore-existing-results",
+        action="store_true",
+        help="忽略output_dir中已有的unified_eval_results.json，重新从空结果开始统计",
+    )
     return parser
 
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
     args.enable_agent45 = not bool(args.disable_agent45)
+    args.include_existing_results = not bool(args.ignore_existing_results)
     run(args)
