@@ -26,27 +26,6 @@ def _normalize_prediction_text(v: Any) -> str:
     return " ".join(str(v).strip().lower().split())
 
 
-def _collect_prediction_targets(preference_constraints: Dict[str, Any]) -> List[Tuple[str, float]]:
-    preds = preference_constraints.get("Predicted_Next_Items", [])
-    if not isinstance(preds, list):
-        return []
-
-    weight_map = {
-        "Most_Likely": 1.0,
-        "Secondary": 0.6,
-        "Possible": 0.3,
-    }
-    out: List[Tuple[str, float]] = []
-    for row in preds:
-        if not isinstance(row, dict):
-            continue
-        token = _normalize_prediction_text(row.get("item_type", ""))
-        likelihood = str(row.get("likelihood", "Possible")).strip()
-        if token:
-            out.append((token, weight_map.get(likelihood, 0.3)))
-    return out
-
-
 class LLMItemReranker:
     """Rerank candidate items with Qwen3-8B via five-level logits weighting."""
 
@@ -177,31 +156,6 @@ class LLMItemReranker:
         item_text = "\n".join(str(x) for x in haystacks).lower()
         return any(token and token in item_text for token in must_avoid)
 
-
-
-    @staticmethod
-    def _prediction_alignment_bonus(preference_constraints: Dict[str, Any], item: Dict[str, Any]) -> float:
-        targets = _collect_prediction_targets(preference_constraints)
-        if not targets:
-            return 0.0
-
-        profile = item.get("profile", {})
-        haystacks = [
-            profile.get("title", ""),
-            json.dumps(profile.get("taxonomy", {}), ensure_ascii=False),
-            json.dumps(profile.get("text_tags", {}), ensure_ascii=False),
-            json.dumps(profile.get("visual_tags", {}), ensure_ascii=False),
-            json.dumps(profile.get("hypotheses", []), ensure_ascii=False),
-        ]
-        item_text = _normalize_prediction_text("\n".join(str(x) for x in haystacks))
-
-        bonus = 0.0
-        for token, weight in targets:
-            if token in item_text:
-                bonus += weight
-        return min(1.5, bonus)
-
-
     def rerank_items(
         self,
         query: str,
@@ -221,11 +175,10 @@ class LLMItemReranker:
 
             prompt = self._build_scoring_prompt(query, preference_constraints, item)
             score_info = self._score_with_logits(prompt)
-            prediction_bonus = 0.0 if disable_prediction_bonus else self._prediction_alignment_bonus(preference_constraints, item)
             enriched = dict(item)
             enriched["llm_weighted_score"] = score_info["weighted_score"]
-            enriched["prediction_bonus"] = prediction_bonus
-            enriched["ranking_score"] = float(score_info["weighted_score"] + prediction_bonus)
+            enriched["prediction_bonus"] = 0.0
+            enriched["ranking_score"] = float(score_info["weighted_score"])
             enriched["score_probs"] = score_info["probs"]
             scored.append(enriched)
 
