@@ -453,6 +453,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             continue
 
         print(f"\n[UserLoop] {row_idx + 1}/{len(query_df)} user={user_id} target={target_id}")
+
+        existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
+        if existing_output.exists():
+            print(f"[UserLoop] skip user={user_id}: existing ranking output found at {existing_output}")
+            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            continue
+
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.text_model)
 
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
