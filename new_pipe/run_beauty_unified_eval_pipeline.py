@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,12 @@ except ModuleNotFoundError:
         UserHistoryLogDB,
     )
     from new_pipe.intent_dual_recall_agent import Qwen3RouterLLM
+
+EN_STOPWORDS = {
+    "a", "an", "the", "and", "or", "to", "for", "with", "of", "in", "on", "at", "from", "by",
+    "is", "are", "be", "am", "i", "me", "my", "you", "your", "we", "our", "this", "that", "it",
+    "want", "need", "looking", "interested", "find", "recommend", "please", "can", "could", "would",
+}
 
 
 def _parse_meta_line(line: str) -> dict:
@@ -100,12 +107,7 @@ def _save_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _route_query(
-    query: str,
-    category_catalog: List[str],
-    enable_llm: bool,
-    text_model: str,
-) -> Dict[str, Any]:
+def _route_query(query: str, category_catalog: List[str], enable_llm: bool, text_model: str) -> Dict[str, Any]:
     if not enable_llm:
         return {
             "selected_category_paths": [],
@@ -143,10 +145,7 @@ def _lightweight_profile(meta: Dict[str, Any], item_id: str) -> Dict[str, Any]:
             "category_path": category_paths[0] if category_paths else [],
             "confidence": 0.7,
         },
-        "text_tags": {
-            "summary": str(meta.get("description", "") or ""),
-            "price": meta.get("price", None),
-        },
+        "text_tags": {"summary": str(meta.get("description", "") or ""), "price": meta.get("price", None)},
         "visual_tags": {},
         "hypotheses": ["lightweight_profile_without_vl"],
         "overall_confidence": 0.7,
@@ -158,28 +157,11 @@ def _cleanup_torch_cache() -> None:
         torch.cuda.empty_cache()
 
 
-def _encode_texts(
-    model: SentenceTransformer,
-    texts: List[str],
-    batch_size: int,
-    prompt_name: str | None = None,
-) -> np.ndarray:
+def _encode_texts(model: SentenceTransformer, texts: List[str], batch_size: int, prompt_name: str | None = None) -> np.ndarray:
     if torch is not None:
         with torch.inference_mode():
-            return model.encode(
-                texts,
-                batch_size=batch_size,
-                prompt_name=prompt_name,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
-    return model.encode(
-        texts,
-        batch_size=batch_size,
-        prompt_name=prompt_name,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    )
+            return model.encode(texts, batch_size=batch_size, prompt_name=prompt_name, convert_to_numpy=True, show_progress_bar=False)
+    return model.encode(texts, batch_size=batch_size, prompt_name=prompt_name, convert_to_numpy=True, show_progress_bar=False)
 
 
 def _build_item_embedding_cache(
@@ -199,10 +181,8 @@ def _build_item_embedding_cache(
 
     for start in range(0, total, chunk_size):
         end = min(total, start + chunk_size)
-        chunk_ids = all_item_ids[start:end]
-        chunk_sentences: List[str] = []
-
-        for iid in chunk_ids:
+        chunk_sentences = []
+        for iid in all_item_ids[start:end]:
             sentence = item_sentence_cache.get(iid)
             if not sentence:
                 sentence = _item_sentence(meta_map[iid])
@@ -210,26 +190,12 @@ def _build_item_embedding_cache(
             chunk_sentences.append(sentence)
 
         try:
-            chunk_emb = _encode_texts(
-                model=emb_model,
-                texts=chunk_sentences,
-                batch_size=embed_batch_size,
-                prompt_name=None,
-            )
+            chunk_emb = _encode_texts(emb_model, chunk_sentences, embed_batch_size, prompt_name=None)
         except RuntimeError as exc:
-            msg = str(exc).lower()
-            if "out of memory" in msg and embed_batch_size > 1:
-                smaller_bs = max(1, embed_batch_size // 2)
-                print(
-                    f"[Agent3] OOM at batch_size={embed_batch_size}, retry chunk {start}-{end} "
-                    f"with batch_size={smaller_bs}"
-                )
-                chunk_emb = _encode_texts(
-                    model=emb_model,
-                    texts=chunk_sentences,
-                    batch_size=smaller_bs,
-                    prompt_name=None,
-                )
+            if "out of memory" in str(exc).lower() and embed_batch_size > 1:
+                new_bs = max(1, embed_batch_size // 2)
+                print(f"[Agent3] OOM at batch_size={embed_batch_size}, retry {start}-{end} with batch_size={new_bs}")
+                chunk_emb = _encode_texts(emb_model, chunk_sentences, new_bs, prompt_name=None)
             else:
                 raise
 
@@ -238,32 +204,114 @@ def _build_item_embedding_cache(
         print(f"[Agent3][embedding chunk] {processed}/{total} (chunk={start}-{end})")
 
         if processed % save_every_n == 0 or processed == total:
-            partial_matrix = np.concatenate(all_emb_chunks, axis=0)
+            partial = np.concatenate(all_emb_chunks, axis=0)
             emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                emb_cache_path,
-                item_ids=np.array(all_item_ids[:processed]),
-                item_embeddings=partial_matrix,
-            )
-            print(f"[Agent3][cache save] saved partial embeddings: {processed}/{total} -> {emb_cache_path}")
+            np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids[:processed]), item_embeddings=partial)
+            print(f"[Agent3][cache save] {processed}/{total} -> {emb_cache_path}")
 
         _cleanup_torch_cache()
 
     final_emb = np.concatenate(all_emb_chunks, axis=0)
-    emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        emb_cache_path,
-        item_ids=np.array(all_item_ids),
-        item_embeddings=final_emb,
-    )
-    print(f"[Agent3][cache save] final embedding cache saved: {emb_cache_path}")
+    np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids), item_embeddings=final_emb)
     return final_emb
 
 
 def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms = np.clip(norms, 1e-12, None)
-    return matrix / norms
+    return matrix / np.clip(norms, 1e-12, None)
+
+
+def _extract_query_keywords(query: str, max_keywords: int) -> List[str]:
+    tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", query.lower())
+    uniq: List[str] = []
+    seen = set()
+    for t in tokens:
+        if t in EN_STOPWORDS:
+            continue
+        if len(t) <= 1:
+            continue
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+        if len(uniq) >= max_keywords:
+            break
+    return uniq
+
+
+def _keyword_match_score(title_lower: str, keywords: List[str]) -> Tuple[int, List[str]]:
+    matched = [kw for kw in keywords if kw in title_lower]
+    return len(matched), matched
+
+
+def _build_hybrid_recall_ids(
+    all_item_ids: List[str],
+    title_lower_map: Dict[str, str],
+    keywords: List[str],
+    rank_indices: np.ndarray,
+    target_id: str,
+    topk: int,
+    fallback_topk: int,
+    kw_top1_limit: int,
+    kw_top2_limit: int,
+) -> Tuple[List[str], int, Dict[str, Any]]:
+    matched_scored: List[Tuple[int, str, List[str]]] = []
+    for iid in all_item_ids:
+        score, matched = _keyword_match_score(title_lower_map.get(iid, ""), keywords)
+        if score > 0:
+            matched_scored.append((score, iid, matched))
+    matched_scored.sort(key=lambda x: (-x[0], x[1]))
+    matched_ids = [x[1] for x in matched_scored]
+    matched_set = set(matched_ids)
+
+    kw_selected = matched_ids[:kw_top1_limit]
+    kw_stage = "top100"
+    if target_id not in kw_selected:
+        kw_selected = matched_ids[:kw_top2_limit]
+        kw_stage = "top200"
+
+    strict_non_keyword_extra = target_id not in kw_selected
+    if strict_non_keyword_extra:
+        kw_stage = "top200_plus_embedding_non_keyword"
+
+    def _merge(limit: int) -> List[str]:
+        out = list(kw_selected[: min(limit, len(kw_selected))])
+        seen = set(out)
+        for idx in rank_indices:
+            iid = all_item_ids[int(idx)]
+            if iid in seen:
+                continue
+            if strict_non_keyword_extra and iid in matched_set:
+                continue
+            out.append(iid)
+            seen.add(iid)
+            if len(out) >= limit:
+                break
+        return out
+
+    first_ids = _merge(topk)
+    used_k = topk
+    if target_id not in first_ids:
+        first_ids = _merge(fallback_topk)
+        used_k = fallback_topk
+
+    debug = {
+        "keywords": keywords,
+        "keyword_matched_count": len(matched_ids),
+        "keyword_stage": kw_stage,
+        "keyword_pool_size": len(kw_selected),
+        "strict_non_keyword_extra": strict_non_keyword_extra,
+    }
+    return first_ids, used_k, debug
+
+
+def _print_cumulative_metrics(results: List[Dict[str, Any]]) -> None:
+    if not results:
+        return
+    total = len(results)
+    hits = sum(int(r.get("hit", 0)) for r in results)
+    hr = hits / total
+    avg_k = float(np.mean([float(r.get("used_k", 0)) for r in results]))
+    print(f"[Metrics] processed={total} hits={hits} hit_rate={hr:.4f} avg_used_k={avg_k:.1f}")
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
@@ -276,6 +324,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError(f"No items loaded from filtered meta: {args.filtered_meta_jsonl}")
 
     all_item_ids = sorted(meta_map.keys())
+    title_lower_map = {iid: str(meta_map[iid].get("title", "") or "").lower() for iid in all_item_ids}
+
     cache_dir = Path(args.cache_dir)
     emb_cache_path = cache_dir / "agent3_item_embedding_cache.npz"
     text_cache_path = cache_dir / "agent3_text_cache.json"
@@ -307,7 +357,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     item_emb_norm = _l2_normalize(item_emb_matrix)
-
     global_db = GlobalItemDB(args.global_db)
     history_db = UserHistoryLogDB(args.history_db)
     vl_extractor = Qwen3VLExtractor(model_name=args.vl_model) if args.enable_vl_profiling else None
@@ -328,31 +377,36 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
 
-        q_emb = _encode_texts(
-            model=emb_model,
-            texts=[q_sentence],
-            batch_size=1,
-            prompt_name="query",
-        ).astype(np.float32, copy=False)
+        q_emb = _encode_texts(emb_model, [q_sentence], batch_size=1, prompt_name="query").astype(np.float32, copy=False)
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
         sim_matrix = np.matmul(item_emb_norm, q_emb_norm[0])
         rank_indices = np.argsort(-sim_matrix)
 
-        topk = args.topk
-        top_ids = [all_item_ids[i] for i in rank_indices[:topk]]
+        keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
+        top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
+            all_item_ids=all_item_ids,
+            title_lower_map=title_lower_map,
+            keywords=keywords,
+            rank_indices=rank_indices,
+            target_id=target_id,
+            topk=args.topk,
+            fallback_topk=args.fallback_topk,
+            kw_top1_limit=args.keyword_top1_limit,
+            kw_top2_limit=args.keyword_top2_limit,
+        )
+        print(
+            f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
+            f"stage={kw_debug['keyword_stage']}"
+        )
+
         hit = target_id in top_ids
         if not hit:
-            print(f"[Agent3] miss at k={topk}; retry k={args.fallback_topk}")
-            topk = args.fallback_topk
-            top_ids = [all_item_ids[i] for i in rank_indices[:topk]]
-            hit = target_id in top_ids
-
-        if not hit:
             print("[Agent3] recall failed. metric=0, skip Agent1/2/4/5")
-            results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": topk})
+            results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
+            _print_cumulative_metrics(results)
             continue
 
-        print(f"[Agent3] recall hit at k={topk}; run Agent1/2")
+        print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
         candidate_items: List[Dict[str, Any]] = []
         for i, iid in enumerate(top_ids, start=1):
             meta = meta_map[iid]
@@ -368,10 +422,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         price=str(meta.get("price", "") or ""),
                         category_hint=_meta_category_text(meta),
                     )
-                    profile = vl_extractor.extract(
-                        prompt=f"Profile item: {item_input.title}\n{item_input.detail_text}",
-                        image_paths=[item_input.main_image],
-                    )
+                    profile = vl_extractor.extract(prompt=f"Profile item: {item_input.title}\n{item_input.detail_text}", image_paths=[item_input.main_image])
                 else:
                     profile = _lightweight_profile(meta, iid)
                 global_db.upsert(iid, profile)
@@ -399,10 +450,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         behavior="positive",
                         timestamp=None,
                     )
-                    profile = vl_extractor.extract(
-                        prompt=f"Profile item: {item_input.title}\n{item_input.detail_text}",
-                        image_paths=[item_input.main_image],
-                    )
+                    profile = vl_extractor.extract(prompt=f"Profile item: {item_input.title}\n{item_input.detail_text}", image_paths=[item_input.main_image])
                 else:
                     profile = _lightweight_profile(meta, iid)
                 global_db.upsert(iid, profile)
@@ -410,15 +458,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             if not history_db.exists(user_id=user_id, item_id=iid, behavior="positive", timestamp=None):
                 history_db.insert(user_id=user_id, item_id=iid, behavior="positive", timestamp=None, profile=profile)
 
-            history_rows.append(
-                {
-                    "user_id": user_id,
-                    "item_id": iid,
-                    "behavior": "positive",
-                    "timestamp": None,
-                    "profile": profile,
-                }
-            )
+            history_rows.append({"user_id": user_id, "item_id": iid, "behavior": "positive", "timestamp": None, "profile": profile})
             if i % 20 == 0 or i == len(history_ids):
                 print(f"[Agent2] {i}/{len(history_ids)}")
 
@@ -443,15 +483,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         else:
             print("[Agent4/5] skipped by --disable-agent45")
 
-        results.append(
-            {
-                "user_id": user_id,
-                "target_id": target_id,
-                "hit": 1,
-                "used_k": topk,
-                "top1": ranked_first,
-            }
-        )
+        results.append({
+            "user_id": user_id,
+            "target_id": target_id,
+            "hit": 1,
+            "used_k": used_k,
+            "top1": ranked_first,
+            "kw_debug": kw_debug,
+        })
+        _print_cumulative_metrics(results)
 
     text_cache["items"] = item_sentence_cache
     text_cache["queries"] = query_sentence_cache
@@ -474,6 +514,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-save-every", type=int, default=20000)
     parser.add_argument("--topk", type=int, default=200)
     parser.add_argument("--fallback-topk", type=int, default=500)
+    parser.add_argument("--keyword-top1-limit", type=int, default=100)
+    parser.add_argument("--keyword-top2-limit", type=int, default=200)
+    parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
 
