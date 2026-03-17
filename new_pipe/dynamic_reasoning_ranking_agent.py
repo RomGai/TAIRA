@@ -191,15 +191,17 @@ class Qwen3DynamicReasonerLLM:
                 "任务：根据用户当前query与相关历史正负行为，按时间顺序推理用户此刻偏好，并预测用户下一次最可能购买什么。\n"
                 "要求：\n"
                 "1) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
-                "2) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
-                "3) history 已按 timestamp 升序给出：positive 需要按时间顺序分析演化偏好与已购买轨迹；negative 样本通常无可靠时序，不要按其时间先后推理。\n"
-                "4) 必须结合 history 中 positive 与 negative 的对比证据。\n"
-                "5) Must_Have 可为空（若无法确定硬约束，不要强行填写）。\n"
-                "6) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
-                "7) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 3 条），每条含 item_type/likelihood/evidence；3 条的 likelihood 必须分别是 Most_Likely、Secondary、Possible（各一次）。\n"
-                "8) Must_Have/Nice_to_Have/Must_Avoid 的每个元素都必须是简短自然语言偏好短语（如“Nintendo Switch 兼容性”“无线/蓝牙连接”），禁止输出 JSON/字典/键值对/引号包裹的结构化片段。\n"
-                f"10) {guardrail_block}\n"
-                "11) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Predicted_Next_Items(数组), Reasoning(字符串)。\n\n"
+                "2) query 中明确提出的硬性要求（如品牌、规格、功效、人群、兼容性、尺寸等）必须优先提取并写入 Must_Have。\n"
+                "3) 基于 history（尤其 positive 序列）归纳出的偏好，优先写入 Nice_to_Have。\n"
+                "4) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
+                "5) history 已按 timestamp 升序给出：positive 需要按时间顺序分析演化偏好与已购买轨迹；negative 样本通常无可靠时序，不要按其时间先后推理。\n"
+                "6) 必须结合 history 中 positive 与 negative 的对比证据。\n"
+                "7) Must_Have 与 Nice_to_Have 不限制条目数量，由你根据证据充分性自行决定。\n"
+                "8) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
+                "9) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 1 条），且该条 likelihood 必须是 Most_Likely。\n"
+                "10) Must_Have/Nice_to_Have/Must_Avoid 的每个元素都必须是简短自然语言偏好短语（如“Nintendo Switch 兼容性”“无线/蓝牙连接”），禁止输出 JSON/字典/键值对/引号包裹的结构化片段。\n"
+                f"11) {guardrail_block}\n"
+                "12) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Predicted_Next_Items(数组), Reasoning(字符串)。\n\n"
                 f"当前Query: {clean_query}\n"
                 f"候选池ItemTypeTags(JSON): {json.dumps(candidate_type_tags, ensure_ascii=False)}\n"
                 f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
@@ -211,15 +213,16 @@ class Qwen3DynamicReasonerLLM:
                 "要求：\n"
                 "1) 不要假设额外query意图，不要引用不存在的query信息。\n"
                 "2) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
-                "3) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
-                "4) history 已按 timestamp 升序给出：positive 需要按时间顺序分析演化偏好与已购买轨迹；negative 样本通常无可靠时序，不要按其时间先后推理。\n"
-                "5) 必须结合 history 中 positive 与 negative 的对比证据。\n"
-                "6) Must_Have 可为空（若无法确定硬约束，不要强行填写）。\n"
-                "7) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
-                "8) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 3 条），每条含 item_type/likelihood/evidence；3 条的 likelihood 必须分别是 Most_Likely、Secondary、Possible（各一次）。\n"
-                "9) Must_Have/Nice_to_Have/Must_Avoid 的每个元素都必须是简短自然语言偏好短语（如“Nintendo Switch 兼容性”“无线/蓝牙连接”），禁止输出 JSON/字典/键值对/引号包裹的结构化片段。\n"
-                f"10) {guardrail_block}\n"
-                "11) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Predicted_Next_Items(数组), Reasoning(字符串)。\n\n"
+                "3) 基于 history（尤其 positive 序列）归纳出的偏好，优先写入 Nice_to_Have。\n"
+                "4) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
+                "5) history 已按 timestamp 升序给出：positive 需要按时间顺序分析演化偏好与已购买轨迹；negative 样本通常无可靠时序，不要按其时间先后推理。\n"
+                "6) 必须结合 history 中 positive 与 negative 的对比证据。\n"
+                "7) Must_Have 与 Nice_to_Have 不限制条目数量，由你根据证据充分性自行决定。\n"
+                "8) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
+                "9) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 1 条），且该条 likelihood 必须是 Most_Likely。\n"
+                "10) Must_Have/Nice_to_Have/Must_Avoid 的每个元素都必须是简短自然语言偏好短语（如“Nintendo Switch 兼容性”“无线/蓝牙连接”），禁止输出 JSON/字典/键值对/引号包裹的结构化片段。\n"
+                f"11) {guardrail_block}\n"
+                "12) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Predicted_Next_Items(数组), Reasoning(字符串)。\n\n"
                 f"候选池ItemTypeTags(JSON): {json.dumps(candidate_type_tags, ensure_ascii=False)}\n"
                 f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
             )
@@ -277,85 +280,19 @@ class Qwen3DynamicReasonerLLM:
                 }
             )
 
-        # enforce exactly 3 with one label each: Most_Likely, Secondary, Possible
-        by_label: Dict[str, Dict[str, str]] = {}
-        for row in normalized_preds:
-            lbl = row["likelihood"]
-            if lbl not in by_label:
-                by_label[lbl] = row
+        most_likely = next((row for row in normalized_preds if row["likelihood"] == "Most_Likely"), None)
+        if most_likely is None and normalized_preds:
+            most_likely = dict(normalized_preds[0])
+            most_likely["likelihood"] = "Most_Likely"
 
-        ordered_labels = ["Most_Likely", "Secondary", "Possible"]
-        final_preds: List[Dict[str, str]] = []
-        used_types = set()
-        for lbl in ordered_labels:
-            cand = by_label.get(lbl)
-            if cand and cand["item_type"] not in used_types:
-                final_preds.append(cand)
-                used_types.add(cand["item_type"])
-                continue
-            fill_type = ""
-            for t in candidate_type_tags:
-                if t not in used_types:
-                    fill_type = t
-                    break
-            if not fill_type and candidate_type_tags:
-                fill_type = candidate_type_tags[0]
-            final_preds.append(
-                {
-                    "item_type": fill_type or "Unknown Item Type",
-                    "likelihood": lbl,
-                    "evidence": "fallback_from_candidate_pool",
-                }
-            )
-            used_types.add(fill_type or "Unknown Item Type")
+        if most_likely is None:
+            most_likely = {
+                "item_type": candidate_type_tags[0] if candidate_type_tags else "Unknown Item Type",
+                "likelihood": "Most_Likely",
+                "evidence": "fallback_from_candidate_pool",
+            }
 
-        normalized_preds = final_preds
-
-        raw_preds = payload.get("Predicted_Next_Items", [])
-        if not isinstance(raw_preds, list):
-            raw_preds = []
-
-        normalized_preds: List[Dict[str, str]] = []
-        for row in raw_preds:
-            if not isinstance(row, dict):
-                continue
-            item_type = str(row.get("item_type", "")).strip()
-            likelihood = str(row.get("likelihood", "Possible")).strip()
-            evidence = str(row.get("evidence", "")).strip()
-            if likelihood not in {"Most_Likely", "Secondary", "Possible"}:
-                likelihood = "Possible"
-            if not item_type:
-                continue
-            normalized_preds.append(
-                {
-                    "item_type": item_type,
-                    "likelihood": likelihood,
-                    "evidence": evidence,
-                }
-            )
-
-        if not normalized_preds:
-            fallback_tags = candidate_type_tags[:5]
-            default_likelihoods = ["Most_Likely", "Most_Likely", "Secondary", "Possible", "Possible"]
-            for idx, t in enumerate(fallback_tags):
-                normalized_preds.append(
-                    {
-                        "item_type": t,
-                        "likelihood": default_likelihoods[min(idx, len(default_likelihoods) - 1)],
-                        "evidence": "fallback_from_candidate_pool",
-                    }
-                )
-
-        normalized_preds = normalized_preds[:5]
-        while len(normalized_preds) < 5 and candidate_type_tags:
-            fill = candidate_type_tags[len(normalized_preds) % len(candidate_type_tags)]
-            normalized_preds.append(
-                {
-                    "item_type": fill,
-                    "likelihood": "Possible",
-                    "evidence": "auto_fill_to_5",
-                }
-            )
+        normalized_preds = [most_likely]
 
         return PreferenceConstraints(
             must_have=_normalize_list("Must_Have"),
