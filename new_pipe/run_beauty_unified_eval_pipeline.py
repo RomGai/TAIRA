@@ -315,6 +315,39 @@ def _build_hybrid_recall_ids(
     return first_ids, used_k, debug
 
 
+def _filter_item_ids_by_categories(
+    candidate_item_ids: List[str],
+    meta_map: Dict[str, Dict[str, Any]],
+    selected_categories: List[List[str]],
+) -> List[str]:
+    """Exact-match prefilter by Agent3 selected category paths.
+
+    Matching rule: any selected category path exactly equals one of item's category paths.
+    """
+    if not selected_categories:
+        return candidate_item_ids
+
+    selected_set = {
+        tuple(str(seg).strip().lower() for seg in path if str(seg).strip())
+        for path in selected_categories
+        if isinstance(path, list)
+    }
+    selected_set = {x for x in selected_set if x}
+    if not selected_set:
+        return candidate_item_ids
+
+    filtered: List[str] = []
+    for iid in candidate_item_ids:
+        meta = meta_map.get(iid, {})
+        item_paths = {
+            tuple(str(seg).strip().lower() for seg in path if str(seg).strip())
+            for path in _meta_category_paths(meta)
+        }
+        if item_paths & selected_set:
+            filtered.append(iid)
+    return filtered
+
+
 def _recall_at_k(labels: List[int], k: int) -> float:
     if not labels:
         return 0.0
@@ -444,6 +477,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError(f"No items loaded from filtered meta: {args.filtered_meta_jsonl}")
 
     all_item_ids = sorted(meta_map.keys())
+    item_id_to_index = {iid: idx for idx, iid in enumerate(all_item_ids)}
     title_lower_map = {iid: str(meta_map[iid].get("title", "") or "").lower() for iid in all_item_ids}
 
     cache_dir = Path(args.cache_dir)
@@ -506,14 +540,52 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
 
+        filtered_item_ids = _filter_item_ids_by_categories(
+            candidate_item_ids=all_item_ids,
+            meta_map=meta_map,
+            selected_categories=routed.get("selected_category_paths", []) or [],
+        )
+
+        if not filtered_item_ids:
+            print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
+            _write_recall_failed_zero_output(
+                output_path=existing_output,
+                user_id=user_id,
+                query=q_sentence,
+                target_id=target_id,
+            )
+            results.append(
+                {
+                    "user_id": user_id,
+                    "target_id": target_id,
+                    "hit": 0,
+                    "used_k": 0,
+                    "kw_debug": {
+                        "keywords": [],
+                        "keyword_matched_count": 0,
+                        "keyword_stage": "category_prefilter_empty",
+                        "keyword_pool_size": 0,
+                        "strict_non_keyword_extra": False,
+                        "progressive_step": int(args.progressive_recall_step),
+                        "fixed_keyword_pool_size": 0,
+                        "prefilter_candidate_size": 0,
+                    },
+                }
+            )
+            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            continue
+
+        filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
+        filtered_emb = item_emb_norm[np.array(filtered_idx)]
+
         q_emb = _encode_texts(emb_model, [q_sentence], batch_size=1, prompt_name="query").astype(np.float32, copy=False)
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
-        sim_matrix = np.matmul(item_emb_norm, q_emb_norm[0])
+        sim_matrix = np.matmul(filtered_emb, q_emb_norm[0])
         rank_indices = np.argsort(-sim_matrix)
 
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
         top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
-            all_item_ids=all_item_ids,
+            all_item_ids=filtered_item_ids,
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
@@ -526,7 +598,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
-            f"stage={kw_debug['keyword_stage']}"
+            f"stage={kw_debug['keyword_stage']} prefilter_size={len(filtered_item_ids)}"
         )
 
         hit = target_id in top_ids
