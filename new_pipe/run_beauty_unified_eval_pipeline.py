@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -308,10 +309,47 @@ def _print_cumulative_metrics(results: List[Dict[str, Any]]) -> None:
     if not results:
         return
     total = len(results)
-    hits = sum(int(r.get("hit", 0)) for r in results)
-    hr = hits / total
+    hr10 = float(np.mean([float(r.get("hr@10", 0.0)) for r in results]))
+    ndcg10 = float(np.mean([float(r.get("ndcg@10", 0.0)) for r in results]))
+    mrr10 = float(np.mean([float(r.get("mrr@10", 0.0)) for r in results]))
+    auc = float(np.mean([float(r.get("auc", 0.0)) for r in results]))
     avg_k = float(np.mean([float(r.get("used_k", 0)) for r in results]))
-    print(f"[Metrics] processed={total} hits={hits} hit_rate={hr:.4f} avg_used_k={avg_k:.1f}")
+    print(
+        "[Metrics] "
+        f"processed={total} "
+        f"HR@10={hr10:.4f} "
+        f"NDCG@10={ndcg10:.4f} "
+        f"MRR@10={mrr10:.4f} "
+        f"AUC={auc:.4f} "
+        f"avg_used_k={avg_k:.1f}"
+    )
+
+
+def _auc_one_positive(scores: np.ndarray, positive_index: int) -> float:
+    pos_score = float(scores[positive_index])
+    neg_scores = np.delete(scores, positive_index)
+    if neg_scores.size == 0:
+        return 0.0
+    greater = float(np.sum(pos_score > neg_scores))
+    equal = float(np.sum(pos_score == neg_scores))
+    return (greater + 0.5 * equal) / float(neg_scores.size)
+
+
+def _ranking_metrics_at_10(target_idx: int, scores: np.ndarray) -> Dict[str, float]:
+    rank_indices = np.argsort(-scores)
+    rank_position = int(np.where(rank_indices == target_idx)[0][0]) + 1
+
+    hr10 = 1.0 if rank_position <= 10 else 0.0
+    ndcg10 = (1.0 / math.log2(rank_position + 1)) if rank_position <= 10 else 0.0
+    mrr10 = (1.0 / rank_position) if rank_position <= 10 else 0.0
+    auc = _auc_one_positive(scores=scores, positive_index=target_idx)
+    return {
+        "rank": float(rank_position),
+        "hr@10": hr10,
+        "ndcg@10": ndcg10,
+        "mrr@10": mrr10,
+        "auc": auc,
+    }
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
@@ -382,6 +420,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         sim_matrix = np.matmul(item_emb_norm, q_emb_norm[0])
         rank_indices = np.argsort(-sim_matrix)
 
+        if target_id in all_item_ids:
+            target_idx = all_item_ids.index(target_id)
+            rank_metrics = _ranking_metrics_at_10(target_idx=target_idx, scores=sim_matrix)
+        else:
+            rank_metrics = {"rank": float("inf"), "hr@10": 0.0, "ndcg@10": 0.0, "mrr@10": 0.0, "auc": 0.0}
+
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
         top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
             all_item_ids=all_item_ids,
@@ -402,7 +446,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         hit = target_id in top_ids
         if not hit:
             print("[Agent3] recall failed. metric=0, skip Agent1/2/4/5")
-            results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
+            results.append(
+                {
+                    "user_id": user_id,
+                    "target_id": target_id,
+                    "hit": 0,
+                    "used_k": used_k,
+                    "kw_debug": kw_debug,
+                    **rank_metrics,
+                }
+            )
             _print_cumulative_metrics(results)
             continue
 
@@ -490,6 +543,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "used_k": used_k,
             "top1": ranked_first,
             "kw_debug": kw_debug,
+            **rank_metrics,
         })
         _print_cumulative_metrics(results)
 
@@ -499,7 +553,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     _save_json(Path(args.output_dir) / "unified_eval_results.json", results)
 
     hit_rate = float(np.mean([r["hit"] for r in results])) if results else 0.0
-    summary = {"rows": len(results), "hit_rate": hit_rate, "output_dir": args.output_dir}
+    summary = {
+        "rows": len(results),
+        "hit_rate": hit_rate,
+        "hr@10": float(np.mean([float(r.get("hr@10", 0.0)) for r in results])) if results else 0.0,
+        "ndcg@10": float(np.mean([float(r.get("ndcg@10", 0.0)) for r in results])) if results else 0.0,
+        "mrr@10": float(np.mean([float(r.get("mrr@10", 0.0)) for r in results])) if results else 0.0,
+        "auc": float(np.mean([float(r.get("auc", 0.0)) for r in results])) if results else 0.0,
+        "output_dir": args.output_dir,
+    }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 
