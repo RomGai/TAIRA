@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import glob
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -253,6 +255,7 @@ def _build_hybrid_recall_ids(
     fallback_topk: int,
     kw_top1_limit: int,
     kw_top2_limit: int,
+    progressive_step: int,
 ) -> Tuple[List[str], int, Dict[str, Any]]:
     matched_scored: List[Tuple[int, str, List[str]]] = []
     for iid in all_item_ids:
@@ -273,8 +276,12 @@ def _build_hybrid_recall_ids(
     if strict_non_keyword_extra:
         kw_stage = "top200_plus_embedding_non_keyword"
 
+    max_k = max(1, int(fallback_topk))
+    initial_k = max(1, min(int(topk), max_k))
+    fixed_keyword_ids = kw_selected[: min(len(kw_selected), initial_k)]
+
     def _merge(limit: int) -> List[str]:
-        out = list(kw_selected[: min(limit, len(kw_selected))])
+        out = list(fixed_keyword_ids)
         seen = set(out)
         for idx in rank_indices:
             iid = all_item_ids[int(idx)]
@@ -288,11 +295,13 @@ def _build_hybrid_recall_ids(
                 break
         return out
 
-    first_ids = _merge(topk)
-    used_k = topk
-    if target_id not in first_ids:
-        first_ids = _merge(fallback_topk)
-        used_k = fallback_topk
+    used_k = initial_k
+    step = max(1, int(progressive_step))
+
+    first_ids = _merge(used_k)
+    while target_id not in first_ids and used_k < max_k:
+        used_k = min(max_k, used_k + step)
+        first_ids = _merge(used_k)
 
     debug = {
         "keywords": keywords,
@@ -300,18 +309,129 @@ def _build_hybrid_recall_ids(
         "keyword_stage": kw_stage,
         "keyword_pool_size": len(kw_selected),
         "strict_non_keyword_extra": strict_non_keyword_extra,
+        "progressive_step": step,
+        "fixed_keyword_pool_size": len(fixed_keyword_ids),
     }
     return first_ids, used_k, debug
 
 
-def _print_cumulative_metrics(results: List[Dict[str, Any]]) -> None:
-    if not results:
+def _recall_at_k(labels: List[int], k: int) -> float:
+    if not labels:
+        return 0.0
+    return float(sum(labels[:k]))
+
+
+def _mrr_at_k(labels: List[int], k: int) -> float:
+    for i, label in enumerate(labels[:k], start=1):
+        if int(label) == 1:
+            return 1.0 / i
+    return 0.0
+
+
+def _ndcg_at_k(labels: List[int], k: int) -> float:
+    ranked = labels[:k]
+    dcg = 0.0
+    for i, rel in enumerate(ranked, start=1):
+        dcg += (2 ** int(rel) - 1) / math.log2(i + 1)
+
+    ideal = sorted((int(x) for x in labels), reverse=True)[:k]
+    idcg = 0.0
+    for i, rel in enumerate(ideal, start=1):
+        idcg += (2 ** rel - 1) / math.log2(i + 1)
+
+    if idcg <= 0:
+        return 0.0
+    return dcg / idcg
+
+
+def _safe_item_id(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("item_id", "")).strip()
+    return str(value or "").strip()
+
+
+def _calc_metrics_from_dynamic_output(path: Path, top_n: int = 10) -> Dict[str, float] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[Metrics] skip unreadable file: {path.name} error={exc}")
+        return None
+
+    target_id = _safe_item_id(payload.get("groundtruth_target_item_id"))
+    if not target_id:
+        print(f"[Metrics] skip file without groundtruth_target_item_id: {path.name}")
+        return None
+
+    ranked_items = payload.get("ranked_items", [])
+    if not isinstance(ranked_items, list):
+        ranked_items = []
+
+    top_ranked_ids = [_safe_item_id(x) for x in ranked_items[:top_n]]
+    labels = [1 if iid and iid == target_id else 0 for iid in top_ranked_ids]
+    if not labels:
+        labels = [0]
+
+    return {
+        "recall@10": _recall_at_k(labels, top_n),
+        "ndcg@10": _ndcg_at_k(labels, top_n),
+        "mrr@10": _mrr_at_k(labels, top_n),
+    }
+
+
+def _print_dynamic_output_metrics(output_dir: str | Path, top_n: int = 10) -> None:
+    pattern = str(Path(output_dir) / "*_dynamic_reasoning_ranking_output.json")
+    paths = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not paths:
+        print(f"[Metrics] no ranking outputs found in {output_dir}")
         return
-    total = len(results)
-    hits = sum(int(r.get("hit", 0)) for r in results)
-    hr = hits / total
-    avg_k = float(np.mean([float(r.get("used_k", 0)) for r in results]))
-    print(f"[Metrics] processed={total} hits={hits} hit_rate={hr:.4f} avg_used_k={avg_k:.1f}")
+
+    metric_rows = []
+    for p in paths:
+        row = _calc_metrics_from_dynamic_output(p, top_n=top_n)
+        if row is not None:
+            metric_rows.append(row)
+
+    if not metric_rows:
+        print(f"[Metrics] no valid ranking outputs with groundtruth target in {output_dir}")
+        return
+
+    recall = float(np.mean([x["recall@10"] for x in metric_rows]))
+    ndcg = float(np.mean([x["ndcg@10"] for x in metric_rows]))
+    mrr = float(np.mean([x["mrr@10"] for x in metric_rows]))
+    print(
+        f"[Metrics][Aggregated@10] files={len(metric_rows)} "
+        f"HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
+    )
+
+
+def _write_recall_failed_zero_output(output_path: Path, user_id: str, query: str, target_id: str) -> None:
+    payload = {
+        "user_id": str(user_id),
+        "query": str(query),
+        "preference_constraints": {
+            "Must_Have": [],
+            "Nice_to_Have": [],
+            "Must_Avoid": [],
+            "Predicted_Next_Items": [],
+            "Reasoning": "agent3_recall_failed_skip_agent45",
+        },
+        "ranked_items": [],
+        "groundtruth_target_item_id": str(target_id),
+        "agent3_recall_hit": 0,
+    }
+    _save_json(output_path, payload)
+
+
+def _has_non_empty_ranked_items(output_path: Path) -> bool:
+    if not output_path.exists():
+        return False
+    try:
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[UserLoop] existing output unreadable, rerun user. path={output_path} error={exc}")
+        return False
+    ranked_items = payload.get("ranked_items", [])
+    return isinstance(ranked_items, list) and len(ranked_items) > 0
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
@@ -372,6 +492,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             continue
 
         print(f"\n[UserLoop] {row_idx + 1}/{len(query_df)} user={user_id} target={target_id}")
+
+        existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
+        if _has_non_empty_ranked_items(existing_output):
+            print(f"[UserLoop] skip user={user_id}: existing non-empty ranking output found at {existing_output}")
+            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            continue
+        if existing_output.exists():
+            print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
+
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.text_model)
 
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
@@ -393,6 +522,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             fallback_topk=args.fallback_topk,
             kw_top1_limit=args.keyword_top1_limit,
             kw_top2_limit=args.keyword_top2_limit,
+            progressive_step=args.progressive_recall_step,
         )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
@@ -402,8 +532,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         hit = target_id in top_ids
         if not hit:
             print("[Agent3] recall failed. metric=0, skip Agent1/2/4/5")
+            _write_recall_failed_zero_output(
+                output_path=existing_output,
+                user_id=user_id,
+                query=q_sentence,
+                target_id=target_id,
+            )
             results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
-            _print_cumulative_metrics(results)
+            _print_dynamic_output_metrics(args.output_dir, top_n=10)
             continue
 
         print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
@@ -478,6 +614,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 top_n=args.top_n,
                 save_output=True,
                 output_dir=args.output_dir,
+                groundtruth_target_item_id=target_id,
             )
             ranked_first = module3_out.ranked_items[0]["item_id"] if module3_out.ranked_items else ""
         else:
@@ -491,15 +628,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "top1": ranked_first,
             "kw_debug": kw_debug,
         })
-        _print_cumulative_metrics(results)
+        _print_dynamic_output_metrics(args.output_dir, top_n=10)
 
     text_cache["items"] = item_sentence_cache
     text_cache["queries"] = query_sentence_cache
     _save_json(text_cache_path, text_cache)
     _save_json(Path(args.output_dir) / "unified_eval_results.json", results)
 
-    hit_rate = float(np.mean([r["hit"] for r in results])) if results else 0.0
-    summary = {"rows": len(results), "hit_rate": hit_rate, "output_dir": args.output_dir}
+    recall_rate = float(np.mean([r["hit"] for r in results])) if results else 0.0
+    summary = {"rows": len(results), "recall@k": recall_rate, "output_dir": args.output_dir}
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 
@@ -514,6 +651,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-save-every", type=int, default=20000)
     parser.add_argument("--topk", type=int, default=200)
     parser.add_argument("--fallback-topk", type=int, default=500)
+    parser.add_argument("--progressive-recall-step", type=int, default=100)
     parser.add_argument("--keyword-top1-limit", type=int, default=100)
     parser.add_argument("--keyword-top2-limit", type=int, default=200)
     parser.add_argument("--max-query-keywords", type=int, default=10)
