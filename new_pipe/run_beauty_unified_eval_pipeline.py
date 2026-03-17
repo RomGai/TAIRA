@@ -296,7 +296,8 @@ def _build_hybrid_recall_ids(
         return out
 
     used_k = initial_k
-    step = max(1, int(progressive_step))
+    # NOTE: per requirement, progressive expansion step should align with input top-k.
+    step = max(1, int(topk))
 
     first_ids = _merge(used_k)
     while target_id not in first_ids and used_k < max_k:
@@ -310,6 +311,7 @@ def _build_hybrid_recall_ids(
         "keyword_pool_size": len(kw_selected),
         "strict_non_keyword_extra": strict_non_keyword_extra,
         "progressive_step": step,
+        "requested_progressive_step": int(progressive_step),
         "fixed_keyword_pool_size": len(fixed_keyword_ids),
     }
     return first_ids, used_k, debug
@@ -545,6 +547,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             meta_map=meta_map,
             selected_categories=routed.get("selected_category_paths", []) or [],
         )
+        print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
 
         if not filtered_item_ids:
             print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
@@ -591,7 +594,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             rank_indices=rank_indices,
             target_id=target_id,
             topk=args.topk,
-            fallback_topk=args.fallback_topk,
+            fallback_topk=len(filtered_item_ids),
             kw_top1_limit=args.keyword_top1_limit,
             kw_top2_limit=args.keyword_top2_limit,
             progressive_step=args.progressive_recall_step,
