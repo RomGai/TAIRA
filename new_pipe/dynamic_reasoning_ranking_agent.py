@@ -49,6 +49,7 @@ class Module3Output:
     query: str
     preference_constraints: Dict[str, Any]
     ranked_items: List[Dict[str, Any]]
+    groundtruth_target_item_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -407,6 +408,7 @@ def run_module3(
     disable_prediction_bonus: bool = False,
     save_output: bool = True,
     output_dir: str | Path = "./processed/dynamic_reasoning_ranking_outputs",
+    groundtruth_target_item_id: str = "",
 ) -> Module3Output:
     """One-shot pipeline from Agent-3 output to module-3 final ranking."""
 
@@ -443,6 +445,7 @@ def run_module3(
         query=query,
         preference_constraints=constraints.to_dict(),
         ranked_items=ranked_items,
+        groundtruth_target_item_id=str(groundtruth_target_item_id or ""),
     )
 
     if save_output:
