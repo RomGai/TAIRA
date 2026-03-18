@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import glob
 import json
 import math
 import re
@@ -554,81 +553,53 @@ def _calc_metrics_from_dynamic_output(path: Path, top_n: int = 10) -> Dict[str, 
     }
 
 
-def _print_dynamic_output_metrics(
-    output_dir: str | Path,
+def _get_cached_llm_eval_for_output(
+    path: Path,
+    meta_map: Dict[str, Dict[str, Any]],
+    evaluator: Qwen3RankingEvaluator | None,
+    eval_cache: Dict[str, Any],
     top_n: int = 10,
-    meta_map: Dict[str, Dict[str, Any]] | None = None,
-    evaluator: Qwen3RankingEvaluator | None = None,
-    eval_cache_path: Path | None = None,
+) -> Tuple[Dict[str, Any] | None, bool]:
+    if evaluator is None:
+        return None, False
+    cache_key = str(path.resolve())
+    mtime = path.stat().st_mtime
+    cached = eval_cache.get(cache_key) if isinstance(eval_cache, dict) else None
+    if isinstance(cached, dict) and cached.get("mtime") == mtime:
+        return cached.get("metrics"), False
+
+    eval_row = _calc_llm_eval_from_dynamic_output(path, meta_map=meta_map, evaluator=evaluator, top_n=top_n)
+    if eval_row is not None:
+        eval_cache[cache_key] = {"mtime": mtime, "metrics": eval_row}
+        return eval_row, True
+    return None, False
+
+
+def _print_running_metric_averages(
+    metric_rows_by_user: Dict[str, Dict[str, float]],
+    eval_rows_by_user: Dict[str, Dict[str, Any]],
 ) -> None:
-    pattern = str(Path(output_dir) / "*_dynamic_reasoning_ranking_output.json")
-    paths = [Path(p) for p in sorted(glob.glob(pattern))]
-    if not paths:
-        print(f"[Metrics] no ranking outputs found in {output_dir}")
-        return
-
-    metric_rows = []
-    eval_rows = []
-    eval_cache = _safe_json_load(eval_cache_path, {}) if eval_cache_path is not None else {}
-    cache_updated = False
-    for p in paths:
-        row = _calc_metrics_from_dynamic_output(p, top_n=top_n)
-        if row is not None:
-            metric_rows.append(row)
-        if meta_map is not None and evaluator is not None:
-            cache_key = str(p.resolve())
-            mtime = p.stat().st_mtime
-            cached = eval_cache.get(cache_key) if isinstance(eval_cache, dict) else None
-            if isinstance(cached, dict) and cached.get("mtime") == mtime:
-                eval_row = cached.get("metrics")
-            else:
-                eval_row = _calc_llm_eval_from_dynamic_output(p, meta_map=meta_map, evaluator=evaluator, top_n=top_n)
-                if eval_row is not None and eval_cache_path is not None:
-                    eval_cache[cache_key] = {"mtime": mtime, "metrics": eval_row}
-                    cache_updated = True
-            if eval_row is not None:
-                eval_rows.append(eval_row)
-
+    metric_rows = list(metric_rows_by_user.values())
     if metric_rows:
         recall = float(np.mean([x["recall@10"] for x in metric_rows]))
         ndcg = float(np.mean([x["ndcg@10"] for x in metric_rows]))
         mrr = float(np.mean([x["mrr@10"] for x in metric_rows]))
         print(
-            f"[Metrics][Aggregated@10] files={len(metric_rows)} "
+            f"[Metrics][RunningAvg@10] users={len(metric_rows)} "
             f"HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
         )
     else:
-        print(f"[Metrics] no valid ranking outputs with groundtruth target in {output_dir}")
+        print("[Metrics] no per-user metric rows accumulated yet")
 
+    eval_rows = list(eval_rows_by_user.values())
     if eval_rows:
         eval_hit = float(np.mean([x["eval_hit@10"] for x in eval_rows]))
         eval_ndcg = float(np.mean([x["eval_ndcg@10"] for x in eval_rows]))
         eval_mrr = float(np.mean([x["eval_mrr@10"] for x in eval_rows]))
         print(
-            f"[EvalMetrics][Qwen3-8B@10] files={len(eval_rows)} "
+            f"[EvalMetrics][Qwen3-8B RunningAvg@10] users={len(eval_rows)} "
             f"HitRate={eval_hit:.6f} NDCG={eval_ndcg:.6f} MRR={eval_mrr:.6f}"
         )
-
-    if cache_updated and eval_cache_path is not None:
-        _save_json(eval_cache_path, eval_cache)
-
-
-def _write_recall_failed_zero_output(output_path: Path, user_id: str, query: str, target_id: str) -> None:
-    payload = {
-        "user_id": str(user_id),
-        "query": str(query),
-        "preference_constraints": {
-            "Must_Have": [],
-            "Nice_to_Have": [],
-            "Must_Avoid": [],
-            "Predicted_Next_Items": [],
-            "Reasoning": "agent3_recall_failed_skip_agent45",
-        },
-        "ranked_items": [],
-        "groundtruth_target_item_id": str(target_id),
-        "agent3_recall_hit": 0,
-    }
-    _save_json(output_path, payload)
 
 
 def _has_non_empty_ranked_items(output_path: Path) -> bool:
@@ -695,6 +666,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     category_catalog = sorted({_meta_category_text(v) for v in meta_map.values() if _meta_category_text(v)})
     results: List[Dict[str, Any]] = []
+    running_metric_rows: Dict[str, Dict[str, float]] = {}
+    running_eval_rows: Dict[str, Dict[str, Any]] = {}
+    eval_cache = _safe_json_load(eval_cache_path, {})
+    eval_cache_updated = False
 
     for row_idx, row in query_df.iterrows():
         user_id = str(row["user_id"])
@@ -708,7 +683,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
         if _has_non_empty_ranked_items(existing_output):
             print(f"[UserLoop] skip user={user_id}: existing non-empty ranking output found at {existing_output}")
-            _print_dynamic_output_metrics(args.output_dir, top_n=10, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache_path=eval_cache_path)
+            metric_row = _calc_metrics_from_dynamic_output(existing_output, top_n=10)
+            if metric_row is not None:
+                running_metric_rows[user_id] = metric_row
+            eval_row, cache_changed = _get_cached_llm_eval_for_output(existing_output, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache=eval_cache, top_n=10)
+            if eval_row is not None:
+                running_eval_rows[user_id] = eval_row
+            eval_cache_updated = eval_cache_updated or cache_changed
+            _print_running_metric_averages(running_metric_rows, running_eval_rows)
             continue
         if existing_output.exists():
             print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
@@ -848,7 +830,17 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "top1": ranked_first,
             "kw_debug": kw_debug,
         })
-        _print_dynamic_output_metrics(args.output_dir, top_n=10, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache_path=eval_cache_path)
+        metric_row = _calc_metrics_from_dynamic_output(existing_output, top_n=10)
+        if metric_row is not None:
+            running_metric_rows[user_id] = metric_row
+        eval_row, cache_changed = _get_cached_llm_eval_for_output(existing_output, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache=eval_cache, top_n=10)
+        if eval_row is not None:
+            running_eval_rows[user_id] = eval_row
+        eval_cache_updated = eval_cache_updated or cache_changed
+        _print_running_metric_averages(running_metric_rows, running_eval_rows)
+
+    if eval_cache_updated:
+        _save_json(eval_cache_path, eval_cache)
 
     text_cache["items"] = item_sentence_cache
     text_cache["queries"] = query_sentence_cache
