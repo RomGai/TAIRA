@@ -9,14 +9,18 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 
 try:
     import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 except Exception:  # pragma: no cover
     torch = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
 
 try:
     from dynamic_reasoning_ranking_agent import run_module3
@@ -38,6 +42,28 @@ except ModuleNotFoundError:
         UserHistoryLogDB,
     )
     from new_pipe.intent_dual_recall_agent import Qwen3RouterLLM
+
+def calculate_mrr(ranked_items: List[int]) -> float:
+    reciprocal_ranks = []
+    for rank, score in enumerate(ranked_items, start=1):
+        if score > 0:
+            reciprocal_ranks.append(1 / rank)
+            break
+    return float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0
+
+
+def calculate_ndcg(ranked_items: List[int], p: int = 10) -> float:
+    dcg = 0.0
+    for i in range(min(p, len(ranked_items))):
+        rel_i = ranked_items[i]
+        dcg += rel_i / np.log2(i + 2)
+    ideal_relevance_scores = sorted(ranked_items, reverse=True)
+    idcg = 0.0
+    for i in range(min(p, len(ideal_relevance_scores))):
+        rel_i = ideal_relevance_scores[i]
+        idcg += rel_i / np.log2(i + 2)
+    return dcg / idcg if idcg > 0 else 0.0
+
 
 EN_STOPWORDS = {
     "a", "an", "the", "and", "or", "to", "for", "with", "of", "in", "on", "at", "from", "by",
@@ -250,12 +276,7 @@ def _build_hybrid_recall_ids(
     title_lower_map: Dict[str, str],
     keywords: List[str],
     rank_indices: np.ndarray,
-    target_id: str,
-    topk: int,
-    fallback_topk: int,
-    kw_top1_limit: int,
-    kw_top2_limit: int,
-    progressive_step: int,
+    recall_topk: int,
 ) -> Tuple[List[str], int, Dict[str, Any]]:
     matched_scored: List[Tuple[int, str, List[str]]] = []
     for iid in all_item_ids:
@@ -264,57 +285,36 @@ def _build_hybrid_recall_ids(
             matched_scored.append((score, iid, matched))
     matched_scored.sort(key=lambda x: (-x[0], x[1]))
     matched_ids = [x[1] for x in matched_scored]
-    matched_set = set(matched_ids)
 
-    kw_selected = matched_ids[:kw_top1_limit]
-    kw_stage = "top100"
-    if target_id not in kw_selected:
-        kw_selected = matched_ids[:kw_top2_limit]
-        kw_stage = "top200"
+    fixed_limit = max(1, int(recall_topk))
+    out: List[str] = []
+    seen = set()
 
-    strict_non_keyword_extra = target_id not in kw_selected
-    if strict_non_keyword_extra:
-        kw_stage = "top200_plus_embedding_non_keyword"
-
-    max_k = max(1, int(fallback_topk))
-    initial_k = max(1, min(int(topk), max_k))
-    fixed_keyword_ids = kw_selected[: min(len(kw_selected), initial_k)]
-
-    def _merge(limit: int) -> List[str]:
-        out = list(fixed_keyword_ids)
-        seen = set(out)
-        for idx in rank_indices:
-            iid = all_item_ids[int(idx)]
-            if iid in seen:
-                continue
-            if strict_non_keyword_extra and iid in matched_set:
-                continue
+    for iid in matched_ids[:fixed_limit]:
+        if iid not in seen:
             out.append(iid)
             seen.add(iid)
-            if len(out) >= limit:
-                break
-        return out
+        if len(out) >= fixed_limit:
+            break
 
-    used_k = initial_k
-    # NOTE: per requirement, progressive expansion step should align with input top-k.
-    step = max(1, int(topk))
-
-    first_ids = _merge(used_k)
-    while target_id not in first_ids and used_k < max_k:
-        used_k = min(max_k, used_k + step)
-        first_ids = _merge(used_k)
+    for idx in rank_indices:
+        iid = all_item_ids[int(idx)]
+        if iid in seen:
+            continue
+        out.append(iid)
+        seen.add(iid)
+        if len(out) >= fixed_limit:
+            break
 
     debug = {
         "keywords": keywords,
         "keyword_matched_count": len(matched_ids),
-        "keyword_stage": kw_stage,
-        "keyword_pool_size": len(kw_selected),
-        "strict_non_keyword_extra": strict_non_keyword_extra,
-        "progressive_step": step,
-        "requested_progressive_step": int(progressive_step),
-        "fixed_keyword_pool_size": len(fixed_keyword_ids),
+        "keyword_stage": f"fixed_top_{fixed_limit}",
+        "keyword_pool_size": min(len(matched_ids), fixed_limit),
+        "strict_non_keyword_extra": False,
+        "fixed_keyword_pool_size": min(len(matched_ids), fixed_limit),
     }
-    return first_ids, used_k, debug
+    return out, len(out), debug
 
 
 def _filter_item_ids_by_categories(
@@ -385,6 +385,147 @@ def _safe_item_id(value: Any) -> str:
     return str(value or "").strip()
 
 
+class Qwen3RankingEvaluator:
+    def __init__(self, model_name: str = "Qwen/Qwen3-8B", max_new_tokens: int = 1024, enable_thinking: bool = True) -> None:
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        self.enable_thinking = enable_thinking
+        self._tokenizer = None
+        self._model = None
+
+    def load(self) -> None:
+        if AutoTokenizer is None or AutoModelForCausalLM is None or torch is None:
+            raise ImportError("transformers/torch are not available for Qwen3RankingEvaluator.")
+        if self._tokenizer is not None and self._model is not None:
+            return
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype="auto",
+            device_map="auto",
+        )
+
+    @staticmethod
+    def _try_json_decode(text: str) -> Dict[str, Any] | None:
+        stripped = text.strip()
+        try:
+            payload = json.loads(stripped)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            pass
+        if "```" in stripped:
+            for part in stripped.split("```"):
+                cand = part.replace("json", "", 1).strip()
+                if not cand:
+                    continue
+                try:
+                    payload = json.loads(cand)
+                    if isinstance(payload, dict):
+                        return payload
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    def evaluate(self, query: str, target_title: str, ranked_candidates: List[Dict[str, str]]) -> List[int]:
+        self.load()
+        candidate_lines = []
+        for idx, cand in enumerate(ranked_candidates[:10], start=1):
+            candidate_lines.append(
+                f"{idx}. item_id={cand['item_id']} | title={cand['title']} | categories={cand['categories']} | description={cand['description']}"
+            )
+        prompt = (
+            "你是电商推荐评估器。请参考 agents/evaluate_agent.py 的宽松相关性判断思想，"
+            "评估排序结果前10个商品对用户query的满足程度。\n"
+            "打分规则：0=不相关，1=相关，2=与给定groundtruth样例商品本质上相同或几乎同一商品。\n"
+            "请只输出JSON对象，字段为 relevance_scores，对应10个候选（若候选不足则按实际数量输出）。\n\n"
+            f"用户query: {query}\n"
+            f"groundtruth样例商品标题: {target_title}\n"
+            f"候选商品列表:\n" + "\n".join(candidate_lines)
+        )
+        messages = [{"role": "user", "content": prompt}]
+        text = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
+        )
+        model_inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
+        generated_ids = self._model.generate(**model_inputs, max_new_tokens=self.max_new_tokens)
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+        try:
+            index = len(output_ids) - output_ids[::-1].index(151668)
+        except ValueError:
+            index = 0
+        content = self._tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
+        payload = self._try_json_decode(content) or {}
+        raw_scores = payload.get("relevance_scores", [])
+        if not isinstance(raw_scores, list):
+            raw_scores = []
+        scores: List[int] = []
+        for x in raw_scores[:10]:
+            try:
+                v = int(float(x))
+            except (TypeError, ValueError):
+                v = 0
+            scores.append(0 if v < 0 else 2 if v > 2 else v)
+        while len(scores) < len(ranked_candidates[:10]):
+            scores.append(0)
+        return scores
+
+
+def _build_eval_candidates(ranked_items: List[Any], meta_map: Dict[str, Dict[str, Any]], top_n: int = 10) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for x in ranked_items[:top_n]:
+        iid = _safe_item_id(x)
+        meta = meta_map.get(iid, {})
+        desc = meta.get("description", "")
+        if isinstance(desc, list):
+            desc = " ".join(str(v) for v in desc if str(v).strip())
+        out.append({
+            "item_id": iid,
+            "title": str(meta.get("title", "") or ""),
+            "categories": _meta_category_text(meta),
+            "description": str(desc or "")[:400],
+        })
+    return out
+
+
+def _calc_llm_eval_from_dynamic_output(
+    path: Path,
+    meta_map: Dict[str, Dict[str, Any]],
+    evaluator: Qwen3RankingEvaluator | None,
+    top_n: int = 10,
+) -> Dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[EvalMetrics] skip unreadable file: {path.name} error={exc}")
+        return None
+
+    ranked_items = payload.get("ranked_items", [])
+    if not isinstance(ranked_items, list):
+        ranked_items = []
+    ranked_items = ranked_items[:top_n]
+    if not ranked_items:
+        return {"eval_hit@10": 0.0, "eval_ndcg@10": 0.0, "eval_mrr@10": 0.0, "relevance_scores": []}
+
+    if evaluator is None:
+        raise RuntimeError("Qwen3 ranking evaluator is not initialized.")
+
+    target_id = _safe_item_id(payload.get("groundtruth_target_item_id"))
+    target_title = str(meta_map.get(target_id, {}).get("title", "") or "")
+    query = str(payload.get("query", "") or "")
+    candidates = _build_eval_candidates(ranked_items, meta_map=meta_map, top_n=top_n)
+    scores = evaluator.evaluate(query=query, target_title=target_title, ranked_candidates=candidates)
+    return {
+        "eval_hit@10": float(sum(scores) / 10.0) if scores else 0.0,
+        "eval_ndcg@10": float(calculate_ndcg(scores, p=10)) if scores else 0.0,
+        "eval_mrr@10": float(calculate_mrr(scores)) if scores else 0.0,
+        "relevance_scores": scores,
+    }
+
+
 def _calc_metrics_from_dynamic_output(path: Path, top_n: int = 10) -> Dict[str, float] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -413,7 +554,13 @@ def _calc_metrics_from_dynamic_output(path: Path, top_n: int = 10) -> Dict[str, 
     }
 
 
-def _print_dynamic_output_metrics(output_dir: str | Path, top_n: int = 10) -> None:
+def _print_dynamic_output_metrics(
+    output_dir: str | Path,
+    top_n: int = 10,
+    meta_map: Dict[str, Dict[str, Any]] | None = None,
+    evaluator: Qwen3RankingEvaluator | None = None,
+    eval_cache_path: Path | None = None,
+) -> None:
     pattern = str(Path(output_dir) / "*_dynamic_reasoning_ranking_output.json")
     paths = [Path(p) for p in sorted(glob.glob(pattern))]
     if not paths:
@@ -421,22 +568,49 @@ def _print_dynamic_output_metrics(output_dir: str | Path, top_n: int = 10) -> No
         return
 
     metric_rows = []
+    eval_rows = []
+    eval_cache = _safe_json_load(eval_cache_path, {}) if eval_cache_path is not None else {}
+    cache_updated = False
     for p in paths:
         row = _calc_metrics_from_dynamic_output(p, top_n=top_n)
         if row is not None:
             metric_rows.append(row)
+        if meta_map is not None and evaluator is not None:
+            cache_key = str(p.resolve())
+            mtime = p.stat().st_mtime
+            cached = eval_cache.get(cache_key) if isinstance(eval_cache, dict) else None
+            if isinstance(cached, dict) and cached.get("mtime") == mtime:
+                eval_row = cached.get("metrics")
+            else:
+                eval_row = _calc_llm_eval_from_dynamic_output(p, meta_map=meta_map, evaluator=evaluator, top_n=top_n)
+                if eval_row is not None and eval_cache_path is not None:
+                    eval_cache[cache_key] = {"mtime": mtime, "metrics": eval_row}
+                    cache_updated = True
+            if eval_row is not None:
+                eval_rows.append(eval_row)
 
-    if not metric_rows:
+    if metric_rows:
+        recall = float(np.mean([x["recall@10"] for x in metric_rows]))
+        ndcg = float(np.mean([x["ndcg@10"] for x in metric_rows]))
+        mrr = float(np.mean([x["mrr@10"] for x in metric_rows]))
+        print(
+            f"[Metrics][Aggregated@10] files={len(metric_rows)} "
+            f"HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
+        )
+    else:
         print(f"[Metrics] no valid ranking outputs with groundtruth target in {output_dir}")
-        return
 
-    recall = float(np.mean([x["recall@10"] for x in metric_rows]))
-    ndcg = float(np.mean([x["ndcg@10"] for x in metric_rows]))
-    mrr = float(np.mean([x["mrr@10"] for x in metric_rows]))
-    print(
-        f"[Metrics][Aggregated@10] files={len(metric_rows)} "
-        f"HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
-    )
+    if eval_rows:
+        eval_hit = float(np.mean([x["eval_hit@10"] for x in eval_rows]))
+        eval_ndcg = float(np.mean([x["eval_ndcg@10"] for x in eval_rows]))
+        eval_mrr = float(np.mean([x["eval_mrr@10"] for x in eval_rows]))
+        print(
+            f"[EvalMetrics][Qwen3-8B@10] files={len(eval_rows)} "
+            f"HitRate={eval_hit:.6f} NDCG={eval_ndcg:.6f} MRR={eval_mrr:.6f}"
+        )
+
+    if cache_updated and eval_cache_path is not None:
+        _save_json(eval_cache_path, eval_cache)
 
 
 def _write_recall_failed_zero_output(output_path: Path, user_id: str, query: str, target_id: str) -> None:
@@ -485,6 +659,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     cache_dir = Path(args.cache_dir)
     emb_cache_path = cache_dir / "agent3_item_embedding_cache.npz"
     text_cache_path = cache_dir / "agent3_text_cache.json"
+    eval_cache_path = cache_dir / "agent3_eval_cache.json"
 
     text_cache = _safe_json_load(text_cache_path, {"items": {}, "queries": {}})
     item_sentence_cache: Dict[str, str] = text_cache.get("items", {})
@@ -492,6 +667,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     print(f"[Init] load embedding model: {args.embedding_model}")
     emb_model = SentenceTransformer(args.embedding_model)
+    ranking_evaluator = Qwen3RankingEvaluator(model_name=args.eval_model)
 
     item_ids_cached: List[str] = []
     item_emb_matrix: np.ndarray | None = None
@@ -532,7 +708,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
         if _has_non_empty_ranked_items(existing_output):
             print(f"[UserLoop] skip user={user_id}: existing non-empty ranking output found at {existing_output}")
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            _print_dynamic_output_metrics(args.output_dir, top_n=10, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache_path=eval_cache_path)
             continue
         if existing_output.exists():
             print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
@@ -550,33 +726,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
 
         if not filtered_item_ids:
-            print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
-            _write_recall_failed_zero_output(
-                output_path=existing_output,
-                user_id=user_id,
-                query=q_sentence,
-                target_id=target_id,
-            )
-            results.append(
-                {
-                    "user_id": user_id,
-                    "target_id": target_id,
-                    "hit": 0,
-                    "used_k": 0,
-                    "kw_debug": {
-                        "keywords": [],
-                        "keyword_matched_count": 0,
-                        "keyword_stage": "category_prefilter_empty",
-                        "keyword_pool_size": 0,
-                        "strict_non_keyword_extra": False,
-                        "progressive_step": int(args.progressive_recall_step),
-                        "fixed_keyword_pool_size": 0,
-                        "prefilter_candidate_size": 0,
-                    },
-                }
-            )
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
-            continue
+            print("[Agent3] category exact-match prefilter found 0 items. fallback to embedding top 500 recall.")
+            filtered_item_ids = list(all_item_ids)
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
@@ -592,12 +743,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
-            target_id=target_id,
-            topk=args.topk,
-            fallback_topk=len(filtered_item_ids),
-            kw_top1_limit=args.keyword_top1_limit,
-            kw_top2_limit=args.keyword_top2_limit,
-            progressive_step=args.progressive_recall_step,
+            recall_topk=args.fixed_recall_topk,
         )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
@@ -606,18 +752,17 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         hit = target_id in top_ids
         if not hit:
-            print("[Agent3] recall failed. metric=0, skip Agent1/2/4/5")
-            _write_recall_failed_zero_output(
-                output_path=existing_output,
-                user_id=user_id,
-                query=q_sentence,
-                target_id=target_id,
-            )
-            results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
-            continue
+            print("[Agent3] initial fixed-top recall missed target. fallback to embedding top 500 recall.")
+            top_ids = [filtered_item_ids[int(idx)] for idx in rank_indices[: min(len(rank_indices), 500)]]
+            used_k = len(top_ids)
+            hit = target_id in top_ids
+            kw_debug["fallback_stage"] = "embedding_top_500"
 
-        print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
+        if hit:
+            print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
+        else:
+            print("[Agent3] recall still missed target after embedding top 500 fallback, but continue running Agent1/2/4/5.")
+
         candidate_items: List[Dict[str, Any]] = []
         for i, iid in enumerate(top_ids, start=1):
             meta = meta_map[iid]
@@ -698,12 +843,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         results.append({
             "user_id": user_id,
             "target_id": target_id,
-            "hit": 1,
+            "hit": int(hit),
             "used_k": used_k,
             "top1": ranked_first,
             "kw_debug": kw_debug,
         })
-        _print_dynamic_output_metrics(args.output_dir, top_n=10)
+        _print_dynamic_output_metrics(args.output_dir, top_n=10, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache_path=eval_cache_path)
 
     text_cache["items"] = item_sentence_cache
     text_cache["queries"] = query_sentence_cache
@@ -724,11 +869,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
-    parser.add_argument("--topk", type=int, default=200)
-    parser.add_argument("--fallback-topk", type=int, default=500)
-    parser.add_argument("--progressive-recall-step", type=int, default=100)
-    parser.add_argument("--keyword-top1-limit", type=int, default=100)
-    parser.add_argument("--keyword-top2-limit", type=int, default=200)
+    parser.add_argument("--fixed-recall-topk", type=int, default=250)
     parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
@@ -740,6 +881,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--vl-model", default="Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--text-model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--eval-model", default="Qwen/Qwen3-8B")
     parser.add_argument("--enable-llm-routing", action="store_true", help="开启Qwen3文本路由；默认关闭走规则fallback")
     parser.add_argument("--enable-vl-profiling", action="store_true", help="开启Qwen3-VL画像；默认关闭走轻量画像")
     parser.add_argument("--disable-agent45", action="store_true", help="关闭Agent4/5")
