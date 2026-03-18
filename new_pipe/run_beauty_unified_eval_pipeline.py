@@ -250,71 +250,40 @@ def _build_hybrid_recall_ids(
     title_lower_map: Dict[str, str],
     keywords: List[str],
     rank_indices: np.ndarray,
-    target_id: str,
-    topk: int,
-    fallback_topk: int,
-    kw_top1_limit: int,
-    kw_top2_limit: int,
-    progressive_step: int,
+    fixed_recall_topk: int,
 ) -> Tuple[List[str], int, Dict[str, Any]]:
+    recall_topk = max(1, int(fixed_recall_topk))
+
     matched_scored: List[Tuple[int, str, List[str]]] = []
     for iid in all_item_ids:
         score, matched = _keyword_match_score(title_lower_map.get(iid, ""), keywords)
         if score > 0:
             matched_scored.append((score, iid, matched))
     matched_scored.sort(key=lambda x: (-x[0], x[1]))
-    matched_ids = [x[1] for x in matched_scored]
-    matched_set = set(matched_ids)
+    matched_ids = [x[1] for x in matched_scored[:recall_topk]]
 
-    kw_selected = matched_ids[:kw_top1_limit]
-    kw_stage = "top100"
-    if target_id not in kw_selected:
-        kw_selected = matched_ids[:kw_top2_limit]
-        kw_stage = "top200"
+    embedding_ids: List[str] = []
+    for idx in rank_indices[:recall_topk]:
+        embedding_ids.append(all_item_ids[int(idx)])
 
-    strict_non_keyword_extra = target_id not in kw_selected
-    if strict_non_keyword_extra:
-        kw_stage = "top200_plus_embedding_non_keyword"
-
-    max_k = max(1, int(fallback_topk))
-    initial_k = max(1, min(int(topk), max_k))
-    fixed_keyword_ids = kw_selected[: min(len(kw_selected), initial_k)]
-
-    def _merge(limit: int) -> List[str]:
-        out = list(fixed_keyword_ids)
-        seen = set(out)
-        for idx in rank_indices:
-            iid = all_item_ids[int(idx)]
-            if iid in seen:
-                continue
-            if strict_non_keyword_extra and iid in matched_set:
-                continue
-            out.append(iid)
-            seen.add(iid)
-            if len(out) >= limit:
-                break
-        return out
-
-    used_k = initial_k
-    # NOTE: per requirement, progressive expansion step should align with input top-k.
-    step = max(1, int(topk))
-
-    first_ids = _merge(used_k)
-    while target_id not in first_ids and used_k < max_k:
-        used_k = min(max_k, used_k + step)
-        first_ids = _merge(used_k)
+    merged_ids: List[str] = []
+    seen = set()
+    for iid in matched_ids + embedding_ids:
+        if iid in seen:
+            continue
+        merged_ids.append(iid)
+        seen.add(iid)
 
     debug = {
         "keywords": keywords,
-        "keyword_matched_count": len(matched_ids),
-        "keyword_stage": kw_stage,
-        "keyword_pool_size": len(kw_selected),
-        "strict_non_keyword_extra": strict_non_keyword_extra,
-        "progressive_step": step,
-        "requested_progressive_step": int(progressive_step),
-        "fixed_keyword_pool_size": len(fixed_keyword_ids),
+        "keyword_matched_count": len(matched_scored),
+        "keyword_stage": f"fixed_top{recall_topk}",
+        "keyword_pool_size": len(matched_ids),
+        "embedding_pool_size": len(embedding_ids),
+        "merged_pool_size": len(merged_ids),
+        "fixed_recall_topk": recall_topk,
     }
-    return first_ids, used_k, debug
+    return merged_ids, len(merged_ids), debug
 
 
 def _filter_item_ids_by_categories(
@@ -385,7 +354,7 @@ def _safe_item_id(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _calc_metrics_from_dynamic_output(path: Path, top_n: int = 10) -> Dict[str, float] | None:
+def _calc_metrics_from_dynamic_output(path: Path, top_n: int) -> Dict[str, float] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -407,36 +376,62 @@ def _calc_metrics_from_dynamic_output(path: Path, top_n: int = 10) -> Dict[str, 
         labels = [0]
 
     return {
-        "recall@10": _recall_at_k(labels, top_n),
-        "ndcg@10": _ndcg_at_k(labels, top_n),
-        "mrr@10": _mrr_at_k(labels, top_n),
+        f"recall@{top_n}": _recall_at_k(labels, top_n),
+        f"ndcg@{top_n}": _ndcg_at_k(labels, top_n),
+        f"mrr@{top_n}": _mrr_at_k(labels, top_n),
     }
 
 
-def _print_dynamic_output_metrics(output_dir: str | Path, top_n: int = 10) -> None:
+def _print_dynamic_output_metrics(output_dir: str | Path, top_ns: List[int] | Tuple[int, ...] = (10, 20, 40)) -> None:
     pattern = str(Path(output_dir) / "*_dynamic_reasoning_ranking_output.json")
     paths = [Path(p) for p in sorted(glob.glob(pattern))]
     if not paths:
         print(f"[Metrics] no ranking outputs found in {output_dir}")
         return
 
-    metric_rows = []
-    for p in paths:
-        row = _calc_metrics_from_dynamic_output(p, top_n=top_n)
-        if row is not None:
-            metric_rows.append(row)
+    normalized_top_ns = []
+    seen_top_ns = set()
+    for k in top_ns:
+        try:
+            top_k = int(k)
+        except (TypeError, ValueError):
+            continue
+        if top_k <= 0 or top_k in seen_top_ns:
+            continue
+        seen_top_ns.add(top_k)
+        normalized_top_ns.append(top_k)
 
-    if not metric_rows:
+    if not normalized_top_ns:
+        print(f"[Metrics] no valid top-k values configured for {output_dir}")
+        return
+
+    metrics_by_topk: Dict[int, List[Dict[str, float]]] = {k: [] for k in normalized_top_ns}
+    for p in paths:
+        for top_k in normalized_top_ns:
+            row = _calc_metrics_from_dynamic_output(p, top_n=top_k)
+            if row is not None:
+                metrics_by_topk[top_k].append(row)
+
+    available_topks = [k for k in normalized_top_ns if metrics_by_topk[k]]
+    if not available_topks:
         print(f"[Metrics] no valid ranking outputs with groundtruth target in {output_dir}")
         return
 
-    recall = float(np.mean([x["recall@10"] for x in metric_rows]))
-    ndcg = float(np.mean([x["ndcg@10"] for x in metric_rows]))
-    mrr = float(np.mean([x["mrr@10"] for x in metric_rows]))
-    print(
-        f"[Metrics][Aggregated@10] files={len(metric_rows)} "
-        f"HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
-    )
+    files_count = len(metrics_by_topk[available_topks[0]])
+    metric_chunks = []
+    for top_k in available_topks:
+        metric_rows = metrics_by_topk[top_k]
+        recall_key = f"recall@{top_k}"
+        ndcg_key = f"ndcg@{top_k}"
+        mrr_key = f"mrr@{top_k}"
+        recall = float(np.mean([x[recall_key] for x in metric_rows]))
+        ndcg = float(np.mean([x[ndcg_key] for x in metric_rows]))
+        mrr = float(np.mean([x[mrr_key] for x in metric_rows]))
+        metric_chunks.append(
+            f"@{top_k} HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
+        )
+
+    print(f"[Metrics][Aggregated] files={files_count} " + " | ".join(metric_chunks))
 
 
 def _write_recall_failed_zero_output(output_path: Path, user_id: str, query: str, target_id: str) -> None:
@@ -532,7 +527,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
         if _has_non_empty_ranked_items(existing_output):
             print(f"[UserLoop] skip user={user_id}: existing non-empty ranking output found at {existing_output}")
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            _print_dynamic_output_metrics(args.output_dir)
             continue
         if existing_output.exists():
             print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
@@ -568,14 +563,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         "keyword_matched_count": 0,
                         "keyword_stage": "category_prefilter_empty",
                         "keyword_pool_size": 0,
-                        "strict_non_keyword_extra": False,
-                        "progressive_step": int(args.progressive_recall_step),
-                        "fixed_keyword_pool_size": 0,
+                        "embedding_pool_size": 0,
+                        "merged_pool_size": 0,
+                        "fixed_recall_topk": int(args.fixed_recall_topk),
                         "prefilter_candidate_size": 0,
                     },
                 }
             )
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            _print_dynamic_output_metrics(args.output_dir)
             continue
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
@@ -592,12 +587,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
-            target_id=target_id,
-            topk=args.topk,
-            fallback_topk=len(filtered_item_ids),
-            kw_top1_limit=args.keyword_top1_limit,
-            kw_top2_limit=args.keyword_top2_limit,
-            progressive_step=args.progressive_recall_step,
+            fixed_recall_topk=args.fixed_recall_topk,
         )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
@@ -614,7 +604,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 target_id=target_id,
             )
             results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            _print_dynamic_output_metrics(args.output_dir)
             continue
 
         print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
@@ -703,7 +693,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "top1": ranked_first,
             "kw_debug": kw_debug,
         })
-        _print_dynamic_output_metrics(args.output_dir, top_n=10)
+        _print_dynamic_output_metrics(args.output_dir)
 
     text_cache["items"] = item_sentence_cache
     text_cache["queries"] = query_sentence_cache
@@ -724,13 +714,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
-    parser.add_argument("--topk", type=int, default=200)
-    parser.add_argument("--fallback-topk", type=int, default=500)
-    parser.add_argument("--progressive-recall-step", type=int, default=100)
-    parser.add_argument("--keyword-top1-limit", type=int, default=100)
-    parser.add_argument("--keyword-top2-limit", type=int, default=200)
+    parser.add_argument("--fixed-recall-topk", type=int, default=250, help="Agent3标题关键词召回和embedding召回各自采用的固定Top-K。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
-    parser.add_argument("--top-n", type=int, default=20)
+    parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
 
     parser.add_argument("--cache-dir", default="processed/beauty_cache")
