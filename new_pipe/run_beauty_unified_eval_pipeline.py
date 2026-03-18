@@ -426,23 +426,82 @@ class Qwen3RankingEvaluator:
                     continue
         return None
 
-    def evaluate(self, query: str, target_title: str, ranked_candidates: List[Dict[str, str]]) -> List[int]:
+    def evaluate(
+        self,
+        query: str,
+        target_product: str,
+        complements: str,
+        targets: str,
+        recommendation_target: str,
+        ranked_candidates: List[Dict[str, str]],
+    ) -> List[int]:
         self.load()
-        candidate_lines = []
-        for idx, cand in enumerate(ranked_candidates[:10], start=1):
-            candidate_lines.append(
-                f"{idx}. item_id={cand['item_id']} | title={cand['title']} | categories={cand['categories']} | description={cand['description']}"
-            )
-        prompt = (
-            "你是电商推荐评估器。请参考 agents/evaluate_agent.py 的宽松相关性判断思想，"
-            "评估排序结果前10个商品对用户query的满足程度。\n"
-            "打分规则：0=不相关，1=相关，2=与给定groundtruth样例商品本质上相同或几乎同一商品。\n"
-            "请只输出JSON对象，字段为 relevance_scores，对应10个候选（若候选不足则按实际数量输出）。\n\n"
-            f"用户query: {query}\n"
-            f"groundtruth样例商品标题: {target_title}\n"
-            f"候选商品列表:\n" + "\n".join(candidate_lines)
+        result_str = "\n-----\n".join(
+            f"product: {cand['title']} description: {cand['description']}" for cand in ranked_candidates[:10]
         )
-        messages = [{"role": "user", "content": prompt}]
+
+        sys_prompt = ("You are a user who is asking the conversational recommendation system for a certain need. "
+                      "You need a product that can truly meet your needs."
+                      )
+        prompt = (
+            f"Your complete requirements are: \"{query}\"\n"
+            "This query may require the system to recommend one or more products. Some of them are main requirement that is explicitly specified; some are not, "
+            "so the system needs to decide what kind of products to recommend. "
+            "You need to first determine which situation your requirement belongs to, and whether there are other product requirements besides the main requirement. "
+            "If so, please remember that the demand for each product is independent, "
+            "which means that your judgment standard for whether other products meet the needs is not whether it is also another main requirement product. "
+            f"In fact, there is such a sample product that can meet part of your requirement: \"{target_product}\". \n"
+        )
+        if complements != '':
+            prompt += f"In addition, the following goods are complementary to the main demand: {complements}\n" \
+                      "The types of goods involved here can all be matched with the target goods."
+        prompt += (
+            "However, these are just an example, just because it can fulfil your requirements doesn't mean that "
+            "it's features are your requirements, you should still consider it based on your origin requirement statements.\n"
+            "Imagine you are in this real-life situation and carefully understand your needs. "
+            "Consider only the requirements you mention, don't add requirements that aren't mentioned out of thin air!"
+            f"Now, the recommendation list you need to evaluate is only for this one recommend target: '{recommendation_target}'. "
+            "First, you should decide whether this recommended category meets your needs. "
+        )
+        if targets != '':
+            prompt += f"The recommended products should be of the following types: {targets}. \n"
+        prompt += (
+            "This is just a recommendation for part of your recommendation needs. "
+            "You need to judge whether it meets your requirements. "
+            "Please remember again that if it is not the main requirement in your query, it does not mean that it does not meet the recommendation requirements"
+            "As long as this recommended category meets part of your need (for example, your need is fishing, then any fishing tool is OK), "
+            "it is considered 'yes' and you don't need to consider your main requirement. "
+            "If it doesn't meet (It doesn't meet your requirements at all), you should output a point of 0."
+
+            f"If yes, next you will see a recommendation list of 10 items, all of which point to the same recommendation target, "
+            f"which is {recommendation_target} that has been judged above. If {recommendation_target} happens to be the main requirement product, "
+            f"then you need to judge whether each product belongs to this type of product. "
+            f"But, if {recommendation_target} is not the main requirement, "
+            f"then you should not judge whether these products belongs to the main requirement product, "
+
+            f"because they are another type of product. Instead, you need to make judgement **only** based on whether a product belongs to {recommendation_target} itself."
+            f"And if {recommendation_target} can meet your general requirement. "
+
+            f"As long as it is, this is enough to prove that it meet your recommendation requirements."
+            f"The recommend list for the recommend target given by the recommendation system is: \"{result_str}\" "
+            "For some requirements, you don’t need to be too strict. For example, when the requirement is 'without something', "
+            "**as long as the item description does not explicitly mention the existence of this thing, it can be assumed that it is without such thing!!!**"
+            "Your judgment criteria should be very loose. As long as the product is related to the query, you can consider it to meet the requirements."
+            )
+        json_format = """
+            {
+              "relevance_scores": [score1, score2, ... ,score10]
+            }
+        """
+        prompt += (
+            "Output a list of 10 ratings to express your judgment. "
+            "The order in the rating list should correspond to the order of the items in the recommendation list. "
+            "If it meets the requirements, it will correspond to 1 point, if it does not meet the requirements, "
+            "it will correspond to 0 points. In particular, if it is exactly the same as the sample product, it will be given 2 points."
+            "You can first output your reason, and then "
+            f"output the final rating list in an json format:'{json_format}', score is a pure number."
+        )
+        messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}]
         text = self._tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -473,27 +532,67 @@ class Qwen3RankingEvaluator:
         return scores
 
 
+def _beauty_meta_description(meta: Dict[str, Any]) -> str:
+    categories = str(meta.get("categories", "") or "")
+    description = meta.get("description", "")
+    if isinstance(description, list):
+        description = " ".join(str(v) for v in description if str(v).strip())
+    return f"{categories}{str(description or '')}"
+
+
 def _build_eval_candidates(ranked_items: List[Any], meta_map: Dict[str, Dict[str, Any]], top_n: int = 10) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for x in ranked_items[:top_n]:
         iid = _safe_item_id(x)
         meta = meta_map.get(iid, {})
-        desc = meta.get("description", "")
-        if isinstance(desc, list):
-            desc = " ".join(str(v) for v in desc if str(v).strip())
         out.append({
             "item_id": iid,
             "title": str(meta.get("title", "") or ""),
-            "categories": _meta_category_text(meta),
-            "description": str(desc or "")[:400],
+            "description": _beauty_meta_description(meta),
         })
     return out
+
+
+def _extract_complement_titles(meta_map: Dict[str, Dict[str, Any]], target_id: str, limit: int = 15) -> str:
+    target_meta = meta_map.get(target_id, {})
+    related = target_meta.get("related", {}) if isinstance(target_meta, dict) else {}
+    related_ids: List[str] = []
+    for key in ("also_bought", "also_viewed"):
+        vals = related.get(key, []) if isinstance(related, dict) else []
+        if isinstance(vals, list):
+            related_ids.extend(str(x).strip() for x in vals if str(x).strip())
+    titles: List[str] = []
+    seen = set()
+    for iid in related_ids:
+        if iid in seen:
+            continue
+        seen.add(iid)
+        title = str(meta_map.get(iid, {}).get("title", "") or "").strip()
+        if title:
+            titles.append(title)
+        if len(titles) >= limit:
+            break
+    return ", ".join(titles)
+
+
+def _infer_recommendation_target(meta_map: Dict[str, Dict[str, Any]], target_id: str, targets: str) -> str:
+    if str(targets or "").strip():
+        return str(targets).strip()
+    category_paths = _meta_category_paths(meta_map.get(target_id, {}))
+    if category_paths and category_paths[0]:
+        return category_paths[0][-1]
+    return str(meta_map.get(target_id, {}).get("title", "") or "")
 
 
 def _calc_llm_eval_from_dynamic_output(
     path: Path,
     meta_map: Dict[str, Dict[str, Any]],
     evaluator: Qwen3RankingEvaluator | None,
+    query: str,
+    target_product: str,
+    complements: str,
+    targets: str,
+    recommendation_target: str,
     top_n: int = 10,
 ) -> Dict[str, Any] | None:
     try:
@@ -512,11 +611,15 @@ def _calc_llm_eval_from_dynamic_output(
     if evaluator is None:
         raise RuntimeError("Qwen3 ranking evaluator is not initialized.")
 
-    target_id = _safe_item_id(payload.get("groundtruth_target_item_id"))
-    target_title = str(meta_map.get(target_id, {}).get("title", "") or "")
-    query = str(payload.get("query", "") or "")
     candidates = _build_eval_candidates(ranked_items, meta_map=meta_map, top_n=top_n)
-    scores = evaluator.evaluate(query=query, target_title=target_title, ranked_candidates=candidates)
+    scores = evaluator.evaluate(
+        query=query,
+        target_product=target_product,
+        complements=complements,
+        targets=targets,
+        recommendation_target=recommendation_target,
+        ranked_candidates=candidates,
+    )
     return {
         "eval_hit@10": float(sum(scores) / 10.0) if scores else 0.0,
         "eval_ndcg@10": float(calculate_ndcg(scores, p=10)) if scores else 0.0,
@@ -558,6 +661,11 @@ def _get_cached_llm_eval_for_output(
     meta_map: Dict[str, Dict[str, Any]],
     evaluator: Qwen3RankingEvaluator | None,
     eval_cache: Dict[str, Any],
+    query: str,
+    target_product: str,
+    complements: str,
+    targets: str,
+    recommendation_target: str,
     top_n: int = 10,
 ) -> Tuple[Dict[str, Any] | None, bool]:
     if evaluator is None:
@@ -568,7 +676,17 @@ def _get_cached_llm_eval_for_output(
     if isinstance(cached, dict) and cached.get("mtime") == mtime:
         return cached.get("metrics"), False
 
-    eval_row = _calc_llm_eval_from_dynamic_output(path, meta_map=meta_map, evaluator=evaluator, top_n=top_n)
+    eval_row = _calc_llm_eval_from_dynamic_output(
+        path,
+        meta_map=meta_map,
+        evaluator=evaluator,
+        query=query,
+        target_product=target_product,
+        complements=complements,
+        targets=targets,
+        recommendation_target=recommendation_target,
+        top_n=top_n,
+    )
     if eval_row is not None:
         eval_cache[cache_key] = {"mtime": mtime, "metrics": eval_row}
         return eval_row, True
@@ -678,6 +796,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         if not query:
             continue
 
+        target_product = str(meta_map.get(target_id, {}).get("title", "") or row.get("title") or "")
+        targets = str(row.get("targets") or "").strip()
+        complements = _extract_complement_titles(meta_map, target_id)
+        recommendation_target = _infer_recommendation_target(meta_map, target_id, targets)
+
         print(f"\n[UserLoop] {row_idx + 1}/{len(query_df)} user={user_id} target={target_id}")
 
         existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
@@ -686,7 +809,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             metric_row = _calc_metrics_from_dynamic_output(existing_output, top_n=10)
             if metric_row is not None:
                 running_metric_rows[user_id] = metric_row
-            eval_row, cache_changed = _get_cached_llm_eval_for_output(existing_output, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache=eval_cache, top_n=10)
+            eval_row, cache_changed = _get_cached_llm_eval_for_output(existing_output, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache=eval_cache, query=query, target_product=target_product, complements=complements, targets=targets, recommendation_target=recommendation_target, top_n=10)
             if eval_row is not None:
                 running_eval_rows[user_id] = eval_row
             eval_cache_updated = eval_cache_updated or cache_changed
@@ -833,7 +956,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         metric_row = _calc_metrics_from_dynamic_output(existing_output, top_n=10)
         if metric_row is not None:
             running_metric_rows[user_id] = metric_row
-        eval_row, cache_changed = _get_cached_llm_eval_for_output(existing_output, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache=eval_cache, top_n=10)
+        eval_row, cache_changed = _get_cached_llm_eval_for_output(existing_output, meta_map=meta_map, evaluator=ranking_evaluator, eval_cache=eval_cache, query=query, target_product=target_product, complements=complements, targets=targets, recommendation_target=recommendation_target, top_n=10)
         if eval_row is not None:
             running_eval_rows[user_id] = eval_row
         eval_cache_updated = eval_cache_updated or cache_changed
