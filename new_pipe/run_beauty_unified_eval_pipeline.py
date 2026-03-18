@@ -532,12 +532,35 @@ class Qwen3RankingEvaluator:
         return scores
 
 
+def _flatten_meta_value(value: Any) -> str:
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            flat = _flatten_meta_value(item)
+            if flat:
+                parts.append(flat)
+        return " | ".join(parts)
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            flat = _flatten_meta_value(item)
+            if flat:
+                parts.append(f"{key}: {flat}")
+        return " | ".join(parts)
+    return str(value or "").strip()
+
+
 def _beauty_meta_description(meta: Dict[str, Any]) -> str:
-    categories = str(meta.get("categories", "") or "")
-    description = meta.get("description", "")
-    if isinstance(description, list):
-        description = " ".join(str(v) for v in description if str(v).strip())
-    return f"{categories}{str(description or '')}"
+    categories = _flatten_meta_value(meta.get("categories", ""))
+    description = _flatten_meta_value(meta.get("description", ""))
+    parts = [part for part in (categories, description) if part]
+    return " ".join(parts)
+
+
+def _format_eval_product(meta: Dict[str, Any], fallback_title: str = "") -> str:
+    title = str(meta.get("title", "") or fallback_title or "").strip()
+    description = _beauty_meta_description(meta)
+    return f"product: {title} description: {description}".strip()
 
 
 def _build_eval_candidates(ranked_items: List[Any], meta_map: Dict[str, Dict[str, Any]], top_n: int = 10) -> List[Dict[str, str]]:
@@ -567,9 +590,11 @@ def _extract_complement_titles(meta_map: Dict[str, Dict[str, Any]], target_id: s
         if iid in seen:
             continue
         seen.add(iid)
-        title = str(meta_map.get(iid, {}).get("title", "") or "").strip()
+        comp_meta = meta_map.get(iid, {})
+        title = str(comp_meta.get("title", "") or "").strip()
         if title:
-            titles.append(title)
+            comp_desc = _beauty_meta_description(comp_meta)
+            titles.append(f"{title} ({comp_desc})" if comp_desc else title)
         if len(titles) >= limit:
             break
     return ", ".join(titles)
@@ -796,7 +821,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         if not query:
             continue
 
-        target_product = str(meta_map.get(target_id, {}).get("title", "") or row.get("title") or "")
+        target_product = _format_eval_product(meta_map.get(target_id, {}), fallback_title=str(row.get("title") or ""))
         targets = str(row.get("targets") or "").strip()
         complements = _extract_complement_titles(meta_map, target_id)
         recommendation_target = _infer_recommendation_target(meta_map, target_id, targets)
