@@ -250,71 +250,40 @@ def _build_hybrid_recall_ids(
     title_lower_map: Dict[str, str],
     keywords: List[str],
     rank_indices: np.ndarray,
-    target_id: str,
-    topk: int,
-    fallback_topk: int,
-    kw_top1_limit: int,
-    kw_top2_limit: int,
-    progressive_step: int,
+    fixed_recall_topk: int,
 ) -> Tuple[List[str], int, Dict[str, Any]]:
+    recall_topk = max(1, int(fixed_recall_topk))
+
     matched_scored: List[Tuple[int, str, List[str]]] = []
     for iid in all_item_ids:
         score, matched = _keyword_match_score(title_lower_map.get(iid, ""), keywords)
         if score > 0:
             matched_scored.append((score, iid, matched))
     matched_scored.sort(key=lambda x: (-x[0], x[1]))
-    matched_ids = [x[1] for x in matched_scored]
-    matched_set = set(matched_ids)
+    matched_ids = [x[1] for x in matched_scored[:recall_topk]]
 
-    kw_selected = matched_ids[:kw_top1_limit]
-    kw_stage = "top100"
-    if target_id not in kw_selected:
-        kw_selected = matched_ids[:kw_top2_limit]
-        kw_stage = "top200"
+    embedding_ids: List[str] = []
+    for idx in rank_indices[:recall_topk]:
+        embedding_ids.append(all_item_ids[int(idx)])
 
-    strict_non_keyword_extra = target_id not in kw_selected
-    if strict_non_keyword_extra:
-        kw_stage = "top200_plus_embedding_non_keyword"
-
-    max_k = max(1, int(fallback_topk))
-    initial_k = max(1, min(int(topk), max_k))
-    fixed_keyword_ids = kw_selected[: min(len(kw_selected), initial_k)]
-
-    def _merge(limit: int) -> List[str]:
-        out = list(fixed_keyword_ids)
-        seen = set(out)
-        for idx in rank_indices:
-            iid = all_item_ids[int(idx)]
-            if iid in seen:
-                continue
-            if strict_non_keyword_extra and iid in matched_set:
-                continue
-            out.append(iid)
-            seen.add(iid)
-            if len(out) >= limit:
-                break
-        return out
-
-    used_k = initial_k
-    # NOTE: per requirement, progressive expansion step should align with input top-k.
-    step = max(1, int(topk))
-
-    first_ids = _merge(used_k)
-    while target_id not in first_ids and used_k < max_k:
-        used_k = min(max_k, used_k + step)
-        first_ids = _merge(used_k)
+    merged_ids: List[str] = []
+    seen = set()
+    for iid in matched_ids + embedding_ids:
+        if iid in seen:
+            continue
+        merged_ids.append(iid)
+        seen.add(iid)
 
     debug = {
         "keywords": keywords,
-        "keyword_matched_count": len(matched_ids),
-        "keyword_stage": kw_stage,
-        "keyword_pool_size": len(kw_selected),
-        "strict_non_keyword_extra": strict_non_keyword_extra,
-        "progressive_step": step,
-        "requested_progressive_step": int(progressive_step),
-        "fixed_keyword_pool_size": len(fixed_keyword_ids),
+        "keyword_matched_count": len(matched_scored),
+        "keyword_stage": f"fixed_top{recall_topk}",
+        "keyword_pool_size": len(matched_ids),
+        "embedding_pool_size": len(embedding_ids),
+        "merged_pool_size": len(merged_ids),
+        "fixed_recall_topk": recall_topk,
     }
-    return first_ids, used_k, debug
+    return merged_ids, len(merged_ids), debug
 
 
 def _filter_item_ids_by_categories(
@@ -568,9 +537,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         "keyword_matched_count": 0,
                         "keyword_stage": "category_prefilter_empty",
                         "keyword_pool_size": 0,
-                        "strict_non_keyword_extra": False,
-                        "progressive_step": int(args.progressive_recall_step),
-                        "fixed_keyword_pool_size": 0,
+                        "embedding_pool_size": 0,
+                        "merged_pool_size": 0,
+                        "fixed_recall_topk": int(args.fixed_recall_topk),
                         "prefilter_candidate_size": 0,
                     },
                 }
@@ -592,12 +561,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
-            target_id=target_id,
-            topk=args.topk,
-            fallback_topk=len(filtered_item_ids),
-            kw_top1_limit=args.keyword_top1_limit,
-            kw_top2_limit=args.keyword_top2_limit,
-            progressive_step=args.progressive_recall_step,
+            fixed_recall_topk=args.fixed_recall_topk,
         )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
@@ -724,11 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
-    parser.add_argument("--topk", type=int, default=200)
-    parser.add_argument("--fallback-topk", type=int, default=500)
-    parser.add_argument("--progressive-recall-step", type=int, default=100)
-    parser.add_argument("--keyword-top1-limit", type=int, default=100)
-    parser.add_argument("--keyword-top2-limit", type=int, default=200)
+    parser.add_argument("--fixed-recall-topk", type=int, default=250, help="Agent3标题关键词召回和embedding召回各自采用的固定Top-K。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
