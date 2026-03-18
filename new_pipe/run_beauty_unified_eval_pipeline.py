@@ -354,7 +354,7 @@ def _safe_item_id(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _calc_metrics_from_dynamic_output(path: Path, top_n: int = 10) -> Dict[str, float] | None:
+def _calc_metrics_from_dynamic_output(path: Path, top_n: int) -> Dict[str, float] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -376,36 +376,62 @@ def _calc_metrics_from_dynamic_output(path: Path, top_n: int = 10) -> Dict[str, 
         labels = [0]
 
     return {
-        "recall@10": _recall_at_k(labels, top_n),
-        "ndcg@10": _ndcg_at_k(labels, top_n),
-        "mrr@10": _mrr_at_k(labels, top_n),
+        f"recall@{top_n}": _recall_at_k(labels, top_n),
+        f"ndcg@{top_n}": _ndcg_at_k(labels, top_n),
+        f"mrr@{top_n}": _mrr_at_k(labels, top_n),
     }
 
 
-def _print_dynamic_output_metrics(output_dir: str | Path, top_n: int = 10) -> None:
+def _print_dynamic_output_metrics(output_dir: str | Path, top_ns: List[int] | Tuple[int, ...] = (10, 20, 40)) -> None:
     pattern = str(Path(output_dir) / "*_dynamic_reasoning_ranking_output.json")
     paths = [Path(p) for p in sorted(glob.glob(pattern))]
     if not paths:
         print(f"[Metrics] no ranking outputs found in {output_dir}")
         return
 
-    metric_rows = []
-    for p in paths:
-        row = _calc_metrics_from_dynamic_output(p, top_n=top_n)
-        if row is not None:
-            metric_rows.append(row)
+    normalized_top_ns = []
+    seen_top_ns = set()
+    for k in top_ns:
+        try:
+            top_k = int(k)
+        except (TypeError, ValueError):
+            continue
+        if top_k <= 0 or top_k in seen_top_ns:
+            continue
+        seen_top_ns.add(top_k)
+        normalized_top_ns.append(top_k)
 
-    if not metric_rows:
+    if not normalized_top_ns:
+        print(f"[Metrics] no valid top-k values configured for {output_dir}")
+        return
+
+    metrics_by_topk: Dict[int, List[Dict[str, float]]] = {k: [] for k in normalized_top_ns}
+    for p in paths:
+        for top_k in normalized_top_ns:
+            row = _calc_metrics_from_dynamic_output(p, top_n=top_k)
+            if row is not None:
+                metrics_by_topk[top_k].append(row)
+
+    available_topks = [k for k in normalized_top_ns if metrics_by_topk[k]]
+    if not available_topks:
         print(f"[Metrics] no valid ranking outputs with groundtruth target in {output_dir}")
         return
 
-    recall = float(np.mean([x["recall@10"] for x in metric_rows]))
-    ndcg = float(np.mean([x["ndcg@10"] for x in metric_rows]))
-    mrr = float(np.mean([x["mrr@10"] for x in metric_rows]))
-    print(
-        f"[Metrics][Aggregated@10] files={len(metric_rows)} "
-        f"HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
-    )
+    files_count = len(metrics_by_topk[available_topks[0]])
+    metric_chunks = []
+    for top_k in available_topks:
+        metric_rows = metrics_by_topk[top_k]
+        recall_key = f"recall@{top_k}"
+        ndcg_key = f"ndcg@{top_k}"
+        mrr_key = f"mrr@{top_k}"
+        recall = float(np.mean([x[recall_key] for x in metric_rows]))
+        ndcg = float(np.mean([x[ndcg_key] for x in metric_rows]))
+        mrr = float(np.mean([x[mrr_key] for x in metric_rows]))
+        metric_chunks.append(
+            f"@{top_k} HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
+        )
+
+    print(f"[Metrics][Aggregated] files={files_count} " + " | ".join(metric_chunks))
 
 
 def _write_recall_failed_zero_output(output_path: Path, user_id: str, query: str, target_id: str) -> None:
@@ -501,7 +527,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
         if _has_non_empty_ranked_items(existing_output):
             print(f"[UserLoop] skip user={user_id}: existing non-empty ranking output found at {existing_output}")
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            _print_dynamic_output_metrics(args.output_dir)
             continue
         if existing_output.exists():
             print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
@@ -544,7 +570,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     },
                 }
             )
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            _print_dynamic_output_metrics(args.output_dir)
             continue
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
@@ -578,7 +604,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 target_id=target_id,
             )
             results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
-            _print_dynamic_output_metrics(args.output_dir, top_n=10)
+            _print_dynamic_output_metrics(args.output_dir)
             continue
 
         print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
@@ -667,7 +693,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "top1": ranked_first,
             "kw_debug": kw_debug,
         })
-        _print_dynamic_output_metrics(args.output_dir, top_n=10)
+        _print_dynamic_output_metrics(args.output_dir)
 
     text_cache["items"] = item_sentence_cache
     text_cache["queries"] = query_sentence_cache
@@ -690,7 +716,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-save-every", type=int, default=20000)
     parser.add_argument("--fixed-recall-topk", type=int, default=250, help="Agent3标题关键词召回和embedding召回各自采用的固定Top-K。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
-    parser.add_argument("--top-n", type=int, default=20)
+    parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
 
     parser.add_argument("--cache-dir", default="processed/beauty_cache")

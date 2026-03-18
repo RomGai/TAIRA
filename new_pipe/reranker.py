@@ -161,7 +161,7 @@ class LLMItemReranker:
         query: str,
         preference_constraints: Dict[str, Any],
         candidate_items: List[Dict[str, Any]],
-        top_n: int = 20,
+        top_n: int = 40,
         disable_prediction_bonus: bool = False,
     ) -> List[Dict[str, Any]]:
         self.load()
@@ -203,7 +203,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="LLM rerank candidate items from module-3 payload")
     parser.add_argument("input_json", help="JSON containing query/preference_constraints/candidate_items")
-    parser.add_argument("--top-n", type=int, default=21)
+    parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--disable-prediction-bonus", action="store_true")
     args = parser.parse_args()

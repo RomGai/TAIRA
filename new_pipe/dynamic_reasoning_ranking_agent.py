@@ -324,7 +324,7 @@ class RankingScoringAgent:
         query: str,
         preference_constraints: PreferenceConstraints,
         candidate_items: List[Dict[str, Any]],
-        top_n: int = 20,
+        top_n: int = 40,
         disable_prediction_bonus: bool = False,
     ) -> List[Dict[str, Any]]:
         return self.reranker.rerank_items(
@@ -339,7 +339,7 @@ class RankingScoringAgent:
 def run_module3(
     intent_dual_recall_output: Dict[str, Any],
     model_name: str = "Qwen/Qwen3-8B",
-    top_n: int = 20,
+    top_n: int = 40,
     disable_must_avoid: bool = False,
     disable_must_have: bool = False,
     disable_prediction_bonus: bool = False,
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run module-3 dynamic reasoning + ranking")
     parser.add_argument("agent3_output", help="Path to agent-3 output JSON")
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
-    parser.add_argument("--top-n", type=int, default=20)
+    parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--output-dir", default="./processed/dynamic_reasoning_ranking_outputs")
     parser.add_argument("--disable-must-have", action="store_true")
     parser.add_argument("--disable-prediction-bonus", action="store_true")
