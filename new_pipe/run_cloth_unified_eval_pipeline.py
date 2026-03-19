@@ -93,9 +93,8 @@ def _item_sentence(meta: Dict[str, Any]) -> str:
     ).strip()
 
 
-def _query_sentence(query: str, selected_categories: List[List[str]], rewritten: str) -> str:
-    cats = " | ".join(" > ".join(seg for seg in c if seg) for c in selected_categories)
-    return f"categories: {cats}; user_need: {rewritten or query}".strip()
+def _query_sentence(query: str, rewritten: str) -> str:
+    return f"user_need: {rewritten or query}".strip()
 
 
 def _safe_json_load(path: Path, default: Any) -> Any:
@@ -285,38 +284,6 @@ def _build_hybrid_recall_ids(
     }
     return merged_ids, len(merged_ids), debug
 
-
-def _filter_item_ids_by_categories(
-    candidate_item_ids: List[str],
-    meta_map: Dict[str, Dict[str, Any]],
-    selected_categories: List[List[str]],
-) -> List[str]:
-    """Exact-match prefilter by Agent3 selected category paths.
-
-    Matching rule: any selected category path exactly equals one of item's category paths.
-    """
-    if not selected_categories:
-        return candidate_item_ids
-
-    selected_set = {
-        tuple(str(seg).strip().lower() for seg in path if str(seg).strip())
-        for path in selected_categories
-        if isinstance(path, list)
-    }
-    selected_set = {x for x in selected_set if x}
-    if not selected_set:
-        return candidate_item_ids
-
-    filtered: List[str] = []
-    for iid in candidate_item_ids:
-        meta = meta_map.get(iid, {})
-        item_paths = {
-            tuple(str(seg).strip().lower() for seg in path if str(seg).strip())
-            for path in _meta_category_paths(meta)
-        }
-        if item_paths & selected_set:
-            filtered.append(iid)
-    return filtered
 
 
 def _recall_at_k(labels: List[int], k: int) -> float:
@@ -534,44 +501,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.text_model)
 
-        q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
+        q_sentence = _query_sentence(query, routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
 
-        filtered_item_ids = _filter_item_ids_by_categories(
-            candidate_item_ids=all_item_ids,
-            meta_map=meta_map,
-            selected_categories=routed.get("selected_category_paths", []) or [],
-        )
-        print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
-
-        if not filtered_item_ids:
-            print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
-            _write_recall_failed_zero_output(
-                output_path=existing_output,
-                user_id=user_id,
-                query=q_sentence,
-                target_id=target_id,
-            )
-            results.append(
-                {
-                    "user_id": user_id,
-                    "target_id": target_id,
-                    "hit": 0,
-                    "used_k": 0,
-                    "kw_debug": {
-                        "keywords": [],
-                        "keyword_matched_count": 0,
-                        "keyword_stage": "category_prefilter_empty",
-                        "keyword_pool_size": 0,
-                        "embedding_pool_size": 0,
-                        "merged_pool_size": 0,
-                        "fixed_recall_topk": int(args.fixed_recall_topk),
-                        "prefilter_candidate_size": 0,
-                    },
-                }
-            )
-            _print_dynamic_output_metrics(args.output_dir)
-            continue
+        filtered_item_ids = all_item_ids
+        print(f"[Agent3][categories] skip exact-match prefilter; candidate_count={len(filtered_item_ids)}")
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
