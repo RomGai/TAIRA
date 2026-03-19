@@ -93,8 +93,18 @@ def _item_sentence(meta: Dict[str, Any]) -> str:
     ).strip()
 
 
-def _query_sentence(query: str, rewritten: str) -> str:
-    return f"user_need: {rewritten or query}".strip()
+def _query_sentence(
+    query: str,
+    selected_categories: List[List[str]] | str | None = None,
+    rewritten: str | None = None,
+) -> str:
+    if rewritten is None and isinstance(selected_categories, str):
+        rewritten = selected_categories
+        selected_categories = []
+
+    normalized_categories = selected_categories if isinstance(selected_categories, list) else []
+    cats = " | ".join(" > ".join(seg for seg in c if seg) for c in normalized_categories)
+    return f"categories: {cats}; user_need: {rewritten or query}".strip()
 
 
 def _safe_json_load(path: Path, default: Any) -> Any:
