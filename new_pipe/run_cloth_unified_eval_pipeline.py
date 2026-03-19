@@ -93,8 +93,17 @@ def _item_sentence(meta: Dict[str, Any]) -> str:
     ).strip()
 
 
-def _query_sentence(query: str, selected_categories: List[List[str]], rewritten: str) -> str:
-    cats = " | ".join(" > ".join(seg for seg in c if seg) for c in selected_categories)
+def _query_sentence(
+    query: str,
+    selected_categories: List[List[str]] | str | None = None,
+    rewritten: str | None = None,
+) -> str:
+    if rewritten is None and isinstance(selected_categories, str):
+        rewritten = selected_categories
+        selected_categories = []
+
+    normalized_categories = selected_categories if isinstance(selected_categories, list) else []
+    cats = " | ".join(" > ".join(seg for seg in c if seg) for c in normalized_categories)
     return f"categories: {cats}; user_need: {rewritten or query}".strip()
 
 
@@ -250,9 +259,11 @@ def _build_hybrid_recall_ids(
     title_lower_map: Dict[str, str],
     keywords: List[str],
     rank_indices: np.ndarray,
-    fixed_recall_topk: int,
+    keyword_recall_topk: int,
+    embedding_recall_topk: int,
 ) -> Tuple[List[str], int, Dict[str, Any]]:
-    recall_topk = max(1, int(fixed_recall_topk))
+    keyword_topk = max(1, int(keyword_recall_topk))
+    embedding_topk = max(1, int(embedding_recall_topk))
 
     matched_scored: List[Tuple[int, str, List[str]]] = []
     for iid in all_item_ids:
@@ -260,10 +271,10 @@ def _build_hybrid_recall_ids(
         if score > 0:
             matched_scored.append((score, iid, matched))
     matched_scored.sort(key=lambda x: (-x[0], x[1]))
-    matched_ids = [x[1] for x in matched_scored[:recall_topk]]
+    matched_ids = [x[1] for x in matched_scored[:keyword_topk]]
 
     embedding_ids: List[str] = []
-    for idx in rank_indices[:recall_topk]:
+    for idx in rank_indices[:embedding_topk]:
         embedding_ids.append(all_item_ids[int(idx)])
 
     merged_ids: List[str] = []
@@ -277,46 +288,15 @@ def _build_hybrid_recall_ids(
     debug = {
         "keywords": keywords,
         "keyword_matched_count": len(matched_scored),
-        "keyword_stage": f"fixed_top{recall_topk}",
+        "keyword_stage": f"top{keyword_topk}",
         "keyword_pool_size": len(matched_ids),
         "embedding_pool_size": len(embedding_ids),
         "merged_pool_size": len(merged_ids),
-        "fixed_recall_topk": recall_topk,
+        "keyword_recall_topk": keyword_topk,
+        "embedding_recall_topk": embedding_topk,
     }
     return merged_ids, len(merged_ids), debug
 
-
-def _filter_item_ids_by_categories(
-    candidate_item_ids: List[str],
-    meta_map: Dict[str, Dict[str, Any]],
-    selected_categories: List[List[str]],
-) -> List[str]:
-    """Exact-match prefilter by Agent3 selected category paths.
-
-    Matching rule: any selected category path exactly equals one of item's category paths.
-    """
-    if not selected_categories:
-        return candidate_item_ids
-
-    selected_set = {
-        tuple(str(seg).strip().lower() for seg in path if str(seg).strip())
-        for path in selected_categories
-        if isinstance(path, list)
-    }
-    selected_set = {x for x in selected_set if x}
-    if not selected_set:
-        return candidate_item_ids
-
-    filtered: List[str] = []
-    for iid in candidate_item_ids:
-        meta = meta_map.get(iid, {})
-        item_paths = {
-            tuple(str(seg).strip().lower() for seg in path if str(seg).strip())
-            for path in _meta_category_paths(meta)
-        }
-        if item_paths & selected_set:
-            filtered.append(iid)
-    return filtered
 
 
 def _recall_at_k(labels: List[int], k: int) -> float:
@@ -534,44 +514,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.text_model)
 
-        q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
+        q_sentence = _query_sentence(query, routed.get("selected_category_paths", []) or [], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
 
-        filtered_item_ids = _filter_item_ids_by_categories(
-            candidate_item_ids=all_item_ids,
-            meta_map=meta_map,
-            selected_categories=routed.get("selected_category_paths", []) or [],
-        )
-        print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
-
-        if not filtered_item_ids:
-            print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
-            _write_recall_failed_zero_output(
-                output_path=existing_output,
-                user_id=user_id,
-                query=q_sentence,
-                target_id=target_id,
-            )
-            results.append(
-                {
-                    "user_id": user_id,
-                    "target_id": target_id,
-                    "hit": 0,
-                    "used_k": 0,
-                    "kw_debug": {
-                        "keywords": [],
-                        "keyword_matched_count": 0,
-                        "keyword_stage": "category_prefilter_empty",
-                        "keyword_pool_size": 0,
-                        "embedding_pool_size": 0,
-                        "merged_pool_size": 0,
-                        "fixed_recall_topk": int(args.fixed_recall_topk),
-                        "prefilter_candidate_size": 0,
-                    },
-                }
-            )
-            _print_dynamic_output_metrics(args.output_dir)
-            continue
+        filtered_item_ids = all_item_ids
+        print(f"[Agent3][categories] skip exact-match prefilter; candidate_count={len(filtered_item_ids)}")
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
@@ -587,7 +534,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
-            fixed_recall_topk=args.fixed_recall_topk,
+            keyword_recall_topk=args.keyword_recall_topk or args.fixed_recall_topk,
+            embedding_recall_topk=args.embedding_recall_topk or args.fixed_recall_topk,
         )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
@@ -714,7 +662,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
-    parser.add_argument("--fixed-recall-topk", type=int, default=250, help="Agent3标题关键词召回和embedding召回各自采用的固定Top-K。")
+    parser.add_argument("--fixed-recall-topk", type=int, default=250, help="兼容旧参数：当未单独指定关键词/embedding召回Top-K时，作为二者的共同默认值。")
+    parser.add_argument("--keyword-recall-topk", type=int, default=0, help="Agent3基于标题关键词匹配的召回Top-K；<=0时回退到--fixed-recall-topk。")
+    parser.add_argument("--embedding-recall-topk", type=int, default=0, help="Agent3基于embedding相似度的召回Top-K；<=0时回退到--fixed-recall-topk。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
