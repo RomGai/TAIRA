@@ -619,42 +619,46 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
 
-        filtered_item_ids = _filter_item_ids_by_categories(
-            candidate_item_ids=all_item_ids,
-            meta_map=meta_map,
-            selected_categories=routed.get("selected_category_paths", []) or [],
-        )
-        print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
+        if args.agent3_skip_category_prefilter:
+            filtered_item_ids = all_item_ids
+            print(f"[Agent3][categories] skip exact-match prefilter; candidate_count={len(filtered_item_ids)}")
+        else:
+            filtered_item_ids = _filter_item_ids_by_categories(
+                candidate_item_ids=all_item_ids,
+                meta_map=meta_map,
+                selected_categories=routed.get("selected_category_paths", []) or [],
+            )
+            print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
 
-        if not filtered_item_ids:
-            print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
-            _write_recall_failed_zero_output(
-                output_path=existing_output,
-                user_id=user_id,
-                query=q_sentence,
-                target_id=target_id,
-            )
-            results.append(
-                {
-                    "user_id": user_id,
-                    "target_id": target_id,
-                    "hit": 0,
-                    "used_k": 0,
-                    "kw_debug": {
-                        "keywords": [],
-                        "keyword_matched_count": 0,
-                        "keyword_stage": "category_prefilter_empty",
-                        "keyword_pool_size": 0,
-                        "embedding_pool_size": 0,
-                        "merged_pool_size": 0,
-                        "keyword_recall_topk": int(args.agent3_keyword_topk),
-                        "embedding_recall_topk": int(args.agent3_embedding_topk),
-                        "prefilter_candidate_size": 0,
-                    },
-                }
-            )
-            _print_dynamic_output_metrics(args.output_dir)
-            continue
+            if not filtered_item_ids:
+                print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
+                _write_recall_failed_zero_output(
+                    output_path=existing_output,
+                    user_id=user_id,
+                    query=q_sentence,
+                    target_id=target_id,
+                )
+                results.append(
+                    {
+                        "user_id": user_id,
+                        "target_id": target_id,
+                        "hit": 0,
+                        "used_k": 0,
+                        "kw_debug": {
+                            "keywords": [],
+                            "keyword_matched_count": 0,
+                            "keyword_stage": "category_prefilter_empty",
+                            "keyword_pool_size": 0,
+                            "embedding_pool_size": 0,
+                            "merged_pool_size": 0,
+                            "keyword_recall_topk": int(args.agent3_keyword_topk),
+                            "embedding_recall_topk": int(args.agent3_embedding_topk),
+                            "prefilter_candidate_size": 0,
+                        },
+                    }
+                )
+                _print_dynamic_output_metrics(args.output_dir)
+                continue
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
@@ -800,6 +804,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-save-every", type=int, default=20000)
     parser.add_argument("--agent3-keyword-topk", type=int, default=250, help="Agent3基于标题关键词匹配的Top-K召回数量。")
     parser.add_argument("--agent3-embedding-topk", type=int, default=250, help="Agent3基于向量相似度的Top-K召回数量。")
+    parser.add_argument(
+        "--agent3-skip-category-prefilter",
+        action="store_true",
+        help="开启后，Agent3不再先按categories做精确匹配过滤，而是保留categories在查询句中并直接在全库执行关键词/向量召回。",
+    )
     parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
