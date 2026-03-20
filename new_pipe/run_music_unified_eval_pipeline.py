@@ -250,9 +250,11 @@ def _build_hybrid_recall_ids(
     title_lower_map: Dict[str, str],
     keywords: List[str],
     rank_indices: np.ndarray,
-    fixed_recall_topk: int,
+    keyword_recall_topk: int,
+    embedding_recall_topk: int,
 ) -> Tuple[List[str], int, Dict[str, Any]]:
-    recall_topk = max(1, int(fixed_recall_topk))
+    keyword_topk = max(1, int(keyword_recall_topk))
+    embedding_topk = max(1, int(embedding_recall_topk))
 
     matched_scored: List[Tuple[int, str, List[str]]] = []
     for iid in all_item_ids:
@@ -260,10 +262,10 @@ def _build_hybrid_recall_ids(
         if score > 0:
             matched_scored.append((score, iid, matched))
     matched_scored.sort(key=lambda x: (-x[0], x[1]))
-    matched_ids = [x[1] for x in matched_scored[:recall_topk]]
+    matched_ids = [x[1] for x in matched_scored[:keyword_topk]]
 
     embedding_ids: List[str] = []
-    for idx in rank_indices[:recall_topk]:
+    for idx in rank_indices[:embedding_topk]:
         embedding_ids.append(all_item_ids[int(idx)])
 
     merged_ids: List[str] = []
@@ -277,11 +279,12 @@ def _build_hybrid_recall_ids(
     debug = {
         "keywords": keywords,
         "keyword_matched_count": len(matched_scored),
-        "keyword_stage": f"fixed_top{recall_topk}",
+        "keyword_stage": f"keyword_top{keyword_topk}_embedding_top{embedding_topk}",
         "keyword_pool_size": len(matched_ids),
         "embedding_pool_size": len(embedding_ids),
         "merged_pool_size": len(merged_ids),
-        "fixed_recall_topk": recall_topk,
+        "keyword_recall_topk": keyword_topk,
+        "embedding_recall_topk": embedding_topk,
     }
     return merged_ids, len(merged_ids), debug
 
@@ -565,7 +568,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         "keyword_pool_size": 0,
                         "embedding_pool_size": 0,
                         "merged_pool_size": 0,
-                        "fixed_recall_topk": int(args.fixed_recall_topk),
+                        "keyword_recall_topk": int(args.agent3_keyword_topk),
+                        "embedding_recall_topk": int(args.agent3_embedding_topk),
                         "prefilter_candidate_size": 0,
                     },
                 }
@@ -587,7 +591,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
-            fixed_recall_topk=args.fixed_recall_topk,
+            keyword_recall_topk=args.agent3_keyword_topk,
+            embedding_recall_topk=args.agent3_embedding_topk,
         )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
@@ -714,7 +719,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
-    parser.add_argument("--fixed-recall-topk", type=int, default=250, help="Agent3标题关键词召回和embedding召回各自采用的固定Top-K。")
+    parser.add_argument("--agent3-keyword-topk", type=int, default=250, help="Agent3基于标题关键词匹配的Top-K召回数量。")
+    parser.add_argument("--agent3-embedding-topk", type=int, default=250, help="Agent3基于向量相似度的Top-K召回数量。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
