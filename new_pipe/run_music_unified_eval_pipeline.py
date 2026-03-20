@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gc
 import glob
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -157,6 +159,11 @@ def _lightweight_profile(meta: Dict[str, Any], item_id: str) -> Dict[str, Any]:
 def _cleanup_torch_cache() -> None:
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
+    gc.collect()
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    return "out of memory" in str(exc).lower()
 
 
 def _encode_texts(model: SentenceTransformer, texts: List[str], batch_size: int, prompt_name: str | None = None) -> np.ndarray:
@@ -164,6 +171,49 @@ def _encode_texts(model: SentenceTransformer, texts: List[str], batch_size: int,
         with torch.inference_mode():
             return model.encode(texts, batch_size=batch_size, prompt_name=prompt_name, convert_to_numpy=True, show_progress_bar=False)
     return model.encode(texts, batch_size=batch_size, prompt_name=prompt_name, convert_to_numpy=True, show_progress_bar=False)
+
+
+def _move_sentence_transformer_to_device(model: SentenceTransformer, device: str) -> None:
+    if hasattr(model, "to"):
+        model.to(device)
+
+
+def _encode_texts_with_adaptive_fallback(
+    model: SentenceTransformer,
+    texts: List[str],
+    batch_size: int,
+    prompt_name: str | None,
+    device: str,
+) -> Tuple[np.ndarray, int, str]:
+    current_batch_size = max(1, int(batch_size))
+    active_device = device
+
+    while True:
+        try:
+            chunk_emb = _encode_texts(model, texts, current_batch_size, prompt_name=prompt_name)
+            return chunk_emb, current_batch_size, active_device
+        except RuntimeError as exc:
+            if not _is_oom_error(exc):
+                raise
+
+            _cleanup_torch_cache()
+            if active_device != "cpu" and current_batch_size == 1:
+                print("[Agent3] GPU OOM persists at batch_size=1, switch embedding encode to CPU for remaining chunks")
+                _move_sentence_transformer_to_device(model, "cpu")
+                active_device = "cpu"
+                current_batch_size = min(8, max(1, int(batch_size)))
+                continue
+
+            if current_batch_size > 1:
+                next_batch_size = max(1, current_batch_size // 2)
+                print(
+                    f"[Agent3] OOM at batch_size={current_batch_size} on {active_device}, "
+                    f"retry with batch_size={next_batch_size}"
+                )
+                current_batch_size = next_batch_size
+                continue
+
+            raise
 
 
 def _build_item_embedding_cache(
@@ -178,7 +228,15 @@ def _build_item_embedding_cache(
 ) -> np.ndarray:
     total = len(all_item_ids)
     print(f"[Agent3] rebuilding item embedding cache for {total} items")
-    all_emb_chunks: List[np.ndarray] = []
+    emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_emb_path = emb_cache_path.with_suffix(".tmp.npy")
+    if temp_emb_path.exists():
+        temp_emb_path.unlink()
+
+    item_emb_memmap = None
+    active_device = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
+    if active_device == "cpu":
+        _move_sentence_transformer_to_device(emb_model, "cpu")
     processed = 0
 
     for start in range(0, total, chunk_size):
@@ -191,30 +249,51 @@ def _build_item_embedding_cache(
                 item_sentence_cache[iid] = sentence
             chunk_sentences.append(sentence)
 
-        try:
-            chunk_emb = _encode_texts(emb_model, chunk_sentences, embed_batch_size, prompt_name=None)
-        except RuntimeError as exc:
-            if "out of memory" in str(exc).lower() and embed_batch_size > 1:
-                new_bs = max(1, embed_batch_size // 2)
-                print(f"[Agent3] OOM at batch_size={embed_batch_size}, retry {start}-{end} with batch_size={new_bs}")
-                chunk_emb = _encode_texts(emb_model, chunk_sentences, new_bs, prompt_name=None)
-            else:
-                raise
+        chunk_emb, used_batch_size, new_device = _encode_texts_with_adaptive_fallback(
+            emb_model,
+            chunk_sentences,
+            embed_batch_size,
+            prompt_name=None,
+            device=active_device,
+        )
+        if new_device != active_device:
+            active_device = new_device
 
-        all_emb_chunks.append(chunk_emb.astype(np.float32, copy=False))
+        chunk_emb = chunk_emb.astype(np.float32, copy=False)
+        if item_emb_memmap is None:
+            item_emb_memmap = np.lib.format.open_memmap(
+                temp_emb_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(total, chunk_emb.shape[1]),
+            )
+        item_emb_memmap[start:end] = chunk_emb
+        item_emb_memmap.flush()
         processed = end
-        print(f"[Agent3][embedding chunk] {processed}/{total} (chunk={start}-{end})")
+        print(
+            f"[Agent3][embedding chunk] {processed}/{total} "
+            f"(chunk={start}-{end}, batch_size={used_batch_size}, device={active_device})"
+        )
 
-        if processed % save_every_n == 0 or processed == total:
-            partial = np.concatenate(all_emb_chunks, axis=0)
-            emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids[:processed]), item_embeddings=partial)
+        if (processed % save_every_n == 0 or processed == total) and item_emb_memmap is not None:
+            np.savez_compressed(
+                emb_cache_path,
+                item_ids=np.array(all_item_ids[:processed]),
+                item_embeddings=item_emb_memmap[:processed],
+            )
             print(f"[Agent3][cache save] {processed}/{total} -> {emb_cache_path}")
 
+        del chunk_emb
         _cleanup_torch_cache()
 
-    final_emb = np.concatenate(all_emb_chunks, axis=0)
+    if item_emb_memmap is None:
+        raise ValueError("Failed to build item embedding cache: no chunks were encoded")
+
+    final_emb = np.array(item_emb_memmap, dtype=np.float32, copy=True)
     np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids), item_embeddings=final_emb)
+    del item_emb_memmap
+    if os.path.exists(temp_emb_path):
+        os.remove(temp_emb_path)
     return final_emb
 
 
