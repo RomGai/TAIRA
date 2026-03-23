@@ -216,7 +216,7 @@ class ItemRetrievalAgent(Agent):
 
     def recommend_projects_with_reranker(self, user_query, top_n_projects, top_k=10, device='cpu'):
         project_texts = top_n_projects['project_info'].tolist()
-        model_checkpoint = 'bge-reranker-base'
+        model_checkpoint = 'BAAI/bge-reranker-base'
         tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
         model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint)
         model.eval()

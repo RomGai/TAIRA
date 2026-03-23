@@ -110,7 +110,7 @@ class SearcherAgent(Agent):
         if os.path.exists(csv_file_path):
             # print(answer)
             # 读取CSV文件
-            model_checkpoint = 'bge-reranker-base'
+            model_checkpoint = 'BAAI/bge-reranker-base'
             tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
             model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint)
             model.eval()
