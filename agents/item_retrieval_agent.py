@@ -108,7 +108,7 @@ class ItemRetrievalAgent(Agent):
         messages = [{"role": "system", "content": sys_prompt},
                     {"role": "user", "content": prompt}]
         # response = get_completion(messages, llm='gpt-4o-mini')
-        response = self.call_gpt(messages, llm='gpt-4o-mini')
+        response = self.call_gpt(messages, llm=self.config.get('MODEL'))
         print(response)
         structured_preferences = response
         return structured_preferences
