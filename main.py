@@ -90,6 +90,12 @@ def parse_args():
         help='Maximum number of unique recalled items used for final ranking/evaluation.'
     )
     parser.add_argument(
+        '--agent-recall-size',
+        type=int,
+        default=10,
+        help='Number of final recalled items reserved for InteractorAgent output in pipeline mode.'
+    )
+    parser.add_argument(
         '--use-openai-gemini',
         action='store_true',
         help='Route Qwen/Qwen3-8B inference to OpenAI-compatible Gemini endpoint instead of local Qwen.'
@@ -206,7 +212,7 @@ def run_manager_mode(memory, row, domain, config, logger, agents):
     return manager.delegate_task()
 
 
-def run_pipeline_mode(memory, row, domain, config, logger, agents, pipeline_steps, final_recall_size):
+def run_pipeline_mode(memory, row, domain, config, logger, agents, pipeline_steps, final_recall_size, agent_recall_size):
     item_agent, searcher_agent, interactor_agent, _ = agents
 
     user_input = row['new_query']
@@ -260,11 +266,20 @@ def run_pipeline_mode(memory, row, domain, config, logger, agents, pipeline_step
     raw_interactor_ranked_ids = _extract_ranked_ids_from_response(final_json)
     retrieval_id_set = set(retrieval_ranked_ids)
     interactor_ranked_ids = [item_id for item_id in raw_interactor_ranked_ids if item_id in retrieval_id_set]
-    merged_ranked_ids = _dedupe_keep_order(interactor_ranked_ids + retrieval_ranked_ids)[:final_recall_size]
+    selected_agent_ids = _dedupe_keep_order(interactor_ranked_ids)[:agent_recall_size]
+    selected_agent_id_set = set(selected_agent_ids)
+    selected_retrieval_ids = [item_id for item_id in retrieval_ranked_ids if item_id not in selected_agent_id_set]
+    merged_ranked_ids = _dedupe_keep_order(selected_agent_ids + selected_retrieval_ids)[:final_recall_size]
 
     dropped_ids = len(raw_interactor_ranked_ids) - len(interactor_ranked_ids)
     if dropped_ids > 0:
         logger.debug('Dropped %s interactor ids not found in retrieval results.', dropped_ids)
+    logger.debug(
+        'Final merge uses %s agent ids and %s retrieval ids (final_recall_size=%s).',
+        len(selected_agent_ids),
+        max(0, len(merged_ranked_ids) - len(selected_agent_ids)),
+        final_recall_size,
+    )
 
     if outputs.get('interact') or outputs.get('retrieve'):
         final_json['recommendations'] = [{
@@ -292,7 +307,7 @@ def _print_running_average(df_subset, top_ks=(10, 20, 40)):
     print('[RunningAvg] ' + ' | '.join(parts))
 
 
-def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_steps, final_recall_size):
+def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_steps, final_recall_size, agent_recall_size):
     method = config['METHOD'] if execution_mode == 'manager' else f"pipeline-{'-'.join(pipeline_steps)}"
     now = datetime.now()
     formatted_time = now.strftime('%Y-%m-%d %H_%M_%S')
@@ -332,7 +347,7 @@ def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_s
                 }
             else:
                 metrics, fail_flag, pattern_key = run_pipeline_mode(
-                    memory, row, domain, config, logger, agents, pipeline_steps, final_recall_size
+                    memory, row, domain, config, logger, agents, pipeline_steps, final_recall_size, agent_recall_size
                 )
 
             for metric_key, metric_value in metrics.items():
@@ -389,6 +404,10 @@ def main():
         config['USE_OPENAI_GEMINI'] = True
 
     if args.execution_mode == 'pipeline':
+        if args.agent_recall_size < 0:
+            raise ValueError('--agent-recall-size must be >= 0.')
+        if args.agent_recall_size > args.final_recall_size:
+            raise ValueError('--agent-recall-size cannot be larger than --final-recall-size.')
         config['TOPK_ITEMS'] = max(int(config.get('TOPK_ITEMS', 10)), int(args.final_recall_size))
 
     domain, dataset_path = resolve_dataset(config, args.data_dir)
@@ -402,7 +421,16 @@ def main():
         df = df[df['classification'] == 1]
 
     pipeline_steps = [step.strip() for step in args.pipeline.split(',') if step.strip()]
-    process_queries(df, domain, dataset_path, config, args.execution_mode, pipeline_steps, args.final_recall_size)
+    process_queries(
+        df,
+        domain,
+        dataset_path,
+        config,
+        args.execution_mode,
+        pipeline_steps,
+        args.final_recall_size,
+        args.agent_recall_size,
+    )
 
 
 if __name__ == '__main__':
