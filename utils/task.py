@@ -1,13 +1,59 @@
 # utils/task.py
+import random
 import re
+import time
 from functools import lru_cache
 
 import yaml
-from openai import OpenAI
+from openai import APIConnectionError, APIError, OpenAI, RateLimitError
 
 with open('system_config.yaml') as f:
     config = yaml.load(f, Loader=yaml.FullLoader)
 model = config['MODEL']
+
+
+LOCAL_QWEN_PREFIX = 'Qwen/'
+OPENAI_GEMINI_MODEL = 'gemini-3-flash-preview'
+OPENAI_GEMINI_BASE_URL = 'https://ai.juguang.chat/v1'
+OPENAI_GEMINI_API_KEY = 'sk-dGZZdFacB6dZ79DtPLy4rQd9mq0dxgxUBZ2xa4PIHTsNKZdh'
+
+
+def _use_openai_gemini_for_qwen():
+    import os
+
+    return os.environ.get('TAIRA_USE_OPENAI_GEMINI', '').lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _chat_with_openai_gemini(messages, temperature=0):
+    client = OpenAI(
+        api_key=OPENAI_GEMINI_API_KEY,
+        base_url=OPENAI_GEMINI_BASE_URL,
+    )
+
+    max_retries = 5
+    base_delay = 5
+
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=OPENAI_GEMINI_MODEL,
+                messages=messages,
+                max_tokens=32768,
+                stream=False,
+                temperature=temperature if temperature and temperature > 0 else 1,
+            )
+            return response.choices[0].message.content
+        except RateLimitError:
+            wait_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
+            print(f'[RateLimitError] Retry {attempt + 1}, wait {wait_time:.1f}s...')
+            time.sleep(wait_time)
+        except (APIError, APIConnectionError) as exc:
+            wait_time = base_delay + random.uniform(0, 1)
+            print(f'[API/ConnectionError] Retry {attempt + 1}, wait {wait_time:.1f}s...')
+            print(exc)
+            time.sleep(wait_time)
+
+    raise RuntimeError(f'_chat_with_openai_gemini failed after {max_retries} retries.')
 
 
 def _load_runtime_config():
@@ -30,7 +76,7 @@ def _load_local_qwen(model_name):
 
 
 def _is_qwen_local_model(llm_name):
-    return isinstance(llm_name, str) and llm_name.startswith('Qwen/')
+    return isinstance(llm_name, str) and llm_name.startswith(LOCAL_QWEN_PREFIX)
 
 
 def _chat_with_local_qwen(messages, llm_name, temperature=0):
@@ -73,6 +119,8 @@ def get_completion(messages, llm=model, temperature=0):  # claude-3-5-sonnet-202
     llm_name = llm or runtime_config['MODEL']
 
     if _is_qwen_local_model(llm_name):
+        if _use_openai_gemini_for_qwen():
+            return _chat_with_openai_gemini(messages, temperature=temperature)
         return _chat_with_local_qwen(messages, llm_name, temperature=temperature)
 
     client = OpenAI(
@@ -98,6 +146,9 @@ def get_json(messages, json_format, llm=model, temperature=0):
     llm_name = llm or runtime_config['MODEL']
 
     if _is_qwen_local_model(llm_name):
+        if _use_openai_gemini_for_qwen():
+            content = _chat_with_openai_gemini(messages, temperature=temperature)
+            return content
         content = _chat_with_local_qwen(messages, llm_name, temperature=temperature)
         return content
 
