@@ -268,12 +268,28 @@ def run_pipeline_mode(memory, row, domain, config, logger, agents, pipeline_step
                 for item_id in merged_ranked_ids
             ],
         }]
+    recalled_items = [
+        {'id': item_id, 'title': retrieval_title_map.get(item_id, '')}
+        for item_id in merged_ranked_ids
+    ]
 
     target_id = str(row['id'])
     metrics = _compute_topk_metrics(merged_ranked_ids, target_id)
     fail_flag = len(merged_ranked_ids) == 0
-    return metrics, fail_flag, 'direct_pipeline'
+    return metrics, fail_flag, 'direct_pipeline', recalled_items
 
+    dropped_ids = len(raw_interactor_ranked_ids) - len(interactor_ranked_ids)
+    if dropped_ids > 0:
+        logger.debug('Dropped %s interactor ids not found in retrieval results.', dropped_ids)
+
+    if outputs.get('interact') or outputs.get('retrieve'):
+        final_json['recommendations'] = [{
+            'recommendation': 'merged pipeline ranking',
+            'items': [
+                {'id': item_id, 'title': retrieval_title_map.get(item_id, '')}
+                for item_id in merged_ranked_ids
+            ],
+        }]
 
 def _print_running_average(df_subset, top_ks=(10, 20, 40)):
     parts = []
@@ -286,6 +302,12 @@ def _print_running_average(df_subset, top_ks=(10, 20, 40)):
     print('[RunningAvg] ' + ' | '.join(parts))
 
 
+def _append_recall_dump(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8') as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+
+
 def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_steps, final_recall_size):
     method = config['METHOD'] if execution_mode == 'manager' else f"pipeline-{'-'.join(pipeline_steps)}"
     now = datetime.now()
@@ -293,6 +315,7 @@ def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_s
     log_dir = dataset_path / 'logs' / f'{method}-{formatted_time}'
     log_dir.mkdir(parents=True, exist_ok=True)
     results_csv = log_dir / f'result-{method}-{formatted_time}.csv'
+    recall_dump_path = log_dir / f'recalled-items-{method}-{formatted_time}.jsonl'
 
     memory = Memory()
     agents = init_agents(memory)
@@ -313,6 +336,7 @@ def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_s
                 hit_rate, mrr, ndcg, fail_flag, pattern_key = run_manager_mode(
                     memory, row, domain, config, logger, agents
                 )
+                recalled_items = []
                 metrics = {
                     'hit@10': hit_rate,
                     'ndcg@10': ndcg,
@@ -325,7 +349,7 @@ def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_s
                     'mrr@40': mrr,
                 }
             else:
-                metrics, fail_flag, pattern_key = run_pipeline_mode(
+                metrics, fail_flag, pattern_key, recalled_items = run_pipeline_mode(
                     memory, row, domain, config, logger, agents, pipeline_steps, final_recall_size
                 )
 
@@ -341,12 +365,22 @@ def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_s
                 row[metric_key] = 0
             row['fail'] = 1
             row['pattern_used'] = 'error'
+            recalled_items = []
 
         row_df = pd.DataFrame([row])
         if not results_csv.exists():
             row_df.to_csv(results_csv, mode='w', header=True, index=False)
         else:
             row_df.to_csv(results_csv, mode='a', header=False, index=False)
+
+        if execution_mode == 'pipeline':
+            _append_recall_dump(recall_dump_path, {
+                'query_index': int(index + 1),
+                'user_id': str(row.get('user_id', '')),
+                'target_id': str(row.get('id', '')),
+                'query': str(row.get('new_query', '')),
+                'recalled_items': recalled_items,
+            })
 
         complete_df = pd.read_csv(results_csv, encoding='ISO-8859-1')
         _print_running_average(complete_df)
@@ -369,6 +403,8 @@ def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_s
     })
     mean_row.to_csv(results_csv, mode='a', header=False, index=False)
     print(f'Results saved to {results_csv}')
+    if execution_mode == 'pipeline':
+        print(f'Recalled items saved to {recall_dump_path}')
 
 
 def main():
