@@ -1,4 +1,5 @@
 import argparse
+import os
 import json
 import logging
 import math
@@ -87,6 +88,11 @@ def parse_args():
         type=int,
         default=40,
         help='Maximum number of unique recalled items used for final ranking/evaluation.'
+    )
+    parser.add_argument(
+        '--use-openai-gemini',
+        action='store_true',
+        help='Route Qwen/Qwen3-8B inference to OpenAI-compatible Gemini endpoint instead of local Qwen.'
     )
     return parser.parse_args()
 
@@ -377,6 +383,10 @@ def main():
 
     if args.query_number is not None:
         config['QUERY_NUMBER'] = args.query_number
+
+    if args.use_openai_gemini:
+        os.environ['TAIRA_USE_OPENAI_GEMINI'] = '1'
+        config['USE_OPENAI_GEMINI'] = True
 
     if args.execution_mode == 'pipeline':
         config['TOPK_ITEMS'] = max(int(config.get('TOPK_ITEMS', 10)), int(args.final_recall_size))
