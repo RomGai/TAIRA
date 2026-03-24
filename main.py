@@ -96,6 +96,11 @@ def parse_args():
         help='Number of final recalled items reserved for InteractorAgent output in pipeline mode.'
     )
     parser.add_argument(
+        '--agent-use-all-recommendation-groups',
+        action='store_true',
+        help='Use all recommendation groups from InteractorAgent output; default only uses the first group.'
+    )
+    parser.add_argument(
         '--use-openai-gemini',
         action='store_true',
         help='Route Qwen/Qwen3-8B inference to OpenAI-compatible Gemini endpoint instead of local Qwen.'
@@ -109,9 +114,12 @@ def _safe_item_id(value):
     return str(value or '').strip()
 
 
-def _extract_ranked_ids_from_response(final_json):
+def _extract_ranked_ids_from_response(final_json, max_groups=None):
     ranked_ids = []
-    for recommendation in final_json.get('recommendations', []):
+    recommendations = final_json.get('recommendations', [])
+    if max_groups is not None:
+        recommendations = recommendations[:max_groups]
+    for recommendation in recommendations:
         for item in recommendation.get('items', []):
             item_id = _safe_item_id(item)
             if item_id:
@@ -183,11 +191,14 @@ def build_target_product(row, domain):
     return 'no target'
 
 
-def init_agents(memory):
+def init_agents(memory, config):
     item_agent = ItemRetrievalAgent(memory)
     searcher_agent = SearcherAgent(memory)
     interactor_agent = InteractorAgent(memory)
     interpreter = InterpreterAgent(memory)
+    for agent in (item_agent, searcher_agent, interactor_agent, interpreter):
+        if hasattr(agent, 'config') and isinstance(agent.config, dict):
+            agent.config.update(config)
     return item_agent, searcher_agent, interactor_agent, interpreter
 
 
@@ -212,7 +223,18 @@ def run_manager_mode(memory, row, domain, config, logger, agents):
     return manager.delegate_task()
 
 
-def run_pipeline_mode(memory, row, domain, config, logger, agents, pipeline_steps, final_recall_size, agent_recall_size):
+def run_pipeline_mode(
+    memory,
+    row,
+    domain,
+    config,
+    logger,
+    agents,
+    pipeline_steps,
+    final_recall_size,
+    agent_recall_size,
+    use_all_agent_groups,
+):
     item_agent, searcher_agent, interactor_agent, _ = agents
 
     user_input = row['new_query']
@@ -263,7 +285,8 @@ def run_pipeline_mode(memory, row, domain, config, logger, agents, pipeline_step
     retrieval_ranked_ids = [str(item['product_id']) for item in retrieval_records]
     retrieval_title_map = {str(item['product_id']): str(item.get('project_info', '')) for item in retrieval_records}
 
-    raw_interactor_ranked_ids = _extract_ranked_ids_from_response(final_json)
+    max_agent_groups = None if use_all_agent_groups else 1
+    raw_interactor_ranked_ids = _extract_ranked_ids_from_response(final_json, max_groups=max_agent_groups)
     retrieval_id_set = set(retrieval_ranked_ids)
     interactor_ranked_ids = [item_id for item_id in raw_interactor_ranked_ids if item_id in retrieval_id_set]
     selected_agent_ids = _dedupe_keep_order(interactor_ranked_ids)[:agent_recall_size]
@@ -307,7 +330,17 @@ def _print_running_average(df_subset, top_ks=(10, 20, 40)):
     print('[RunningAvg] ' + ' | '.join(parts))
 
 
-def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_steps, final_recall_size, agent_recall_size):
+def process_queries(
+    df,
+    domain,
+    dataset_path,
+    config,
+    execution_mode,
+    pipeline_steps,
+    final_recall_size,
+    agent_recall_size,
+    use_all_agent_groups,
+):
     method = config['METHOD'] if execution_mode == 'manager' else f"pipeline-{'-'.join(pipeline_steps)}"
     now = datetime.now()
     formatted_time = now.strftime('%Y-%m-%d %H_%M_%S')
@@ -316,7 +349,7 @@ def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_s
     results_csv = log_dir / f'result-{method}-{formatted_time}.csv'
 
     memory = Memory()
-    agents = init_agents(memory)
+    agents = init_agents(memory, config)
 
     metric_columns = [
         'hit@10', 'ndcg@10', 'mrr@10',
@@ -347,7 +380,16 @@ def process_queries(df, domain, dataset_path, config, execution_mode, pipeline_s
                 }
             else:
                 metrics, fail_flag, pattern_key = run_pipeline_mode(
-                    memory, row, domain, config, logger, agents, pipeline_steps, final_recall_size, agent_recall_size
+                    memory,
+                    row,
+                    domain,
+                    config,
+                    logger,
+                    agents,
+                    pipeline_steps,
+                    final_recall_size,
+                    agent_recall_size,
+                    use_all_agent_groups,
                 )
 
             for metric_key, metric_value in metrics.items():
@@ -430,6 +472,7 @@ def main():
         pipeline_steps,
         args.final_recall_size,
         args.agent_recall_size,
+        args.agent_use_all_recommendation_groups,
     )
 
 
