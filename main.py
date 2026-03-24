@@ -278,6 +278,18 @@ def run_pipeline_mode(memory, row, domain, config, logger, agents, pipeline_step
     fail_flag = len(merged_ranked_ids) == 0
     return metrics, fail_flag, 'direct_pipeline', recalled_items
 
+    dropped_ids = len(raw_interactor_ranked_ids) - len(interactor_ranked_ids)
+    if dropped_ids > 0:
+        logger.debug('Dropped %s interactor ids not found in retrieval results.', dropped_ids)
+
+    if outputs.get('interact') or outputs.get('retrieve'):
+        final_json['recommendations'] = [{
+            'recommendation': 'merged pipeline ranking',
+            'items': [
+                {'id': item_id, 'title': retrieval_title_map.get(item_id, '')}
+                for item_id in merged_ranked_ids
+            ],
+        }]
 
 def _print_running_average(df_subset, top_ks=(10, 20, 40)):
     parts = []
