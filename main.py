@@ -247,14 +247,26 @@ def run_pipeline_mode(memory, row, domain, config, logger, agents, pipeline_step
             raise ValueError('InteractorAgent did not return valid JSON content.')
         final_json = json.loads(match.group(0))
 
-    interactor_ranked_ids = _extract_ranked_ids_from_response(final_json)
-    retrieval_ranked_ids = [str(item['product_id']) for item in outputs.get('retrieve', [])]
+    retrieval_records = outputs.get('retrieve', [])
+    retrieval_ranked_ids = [str(item['product_id']) for item in retrieval_records]
+    retrieval_title_map = {str(item['product_id']): str(item.get('project_info', '')) for item in retrieval_records}
+
+    raw_interactor_ranked_ids = _extract_ranked_ids_from_response(final_json)
+    retrieval_id_set = set(retrieval_ranked_ids)
+    interactor_ranked_ids = [item_id for item_id in raw_interactor_ranked_ids if item_id in retrieval_id_set]
     merged_ranked_ids = _dedupe_keep_order(interactor_ranked_ids + retrieval_ranked_ids)[:final_recall_size]
 
-    if outputs.get('interact'):
+    dropped_ids = len(raw_interactor_ranked_ids) - len(interactor_ranked_ids)
+    if dropped_ids > 0:
+        logger.debug('Dropped %s interactor ids not found in retrieval results.', dropped_ids)
+
+    if outputs.get('interact') or outputs.get('retrieve'):
         final_json['recommendations'] = [{
             'recommendation': 'merged pipeline ranking',
-            'items': [{'id': item_id, 'title': ''} for item_id in merged_ranked_ids],
+            'items': [
+                {'id': item_id, 'title': retrieval_title_map.get(item_id, '')}
+                for item_id in merged_ranked_ids
+            ],
         }]
 
     target_id = str(row['id'])
