@@ -837,9 +837,92 @@ class RoutingRecallAgent:
         item_scope_ids: Optional[set[str]] = None,
         max_total_recall: int = 500,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        def _safe_rank(rank: int) -> int:
+            return int(rank if rank < 10**9 else 5000)
+
+        def _rank_strength(rank: int) -> float:
+            safe = _safe_rank(rank)
+            return 1.0 / math.log2(safe + 2.0)
+
+        def _estimate_total_recall(trace: List[Dict[str, Any]], hard_cap: int) -> int:
+            if not trace:
+                return int(self._clamp(hard_cap, 50, 500))
+            required: List[float] = []
+            for row in trace:
+                t_rank = _safe_rank(int(row.get("text_rank", 5000)))
+                v_rank = _safe_rank(int(row.get("vl_rank", 5000)))
+                t_w = float(row.get("weights", {}).get("text", 0.5))
+                v_w = float(row.get("weights", {}).get("vl", 0.5))
+                low_rank = min(t_rank, v_rank)
+                high_rank = max(t_rank, v_rank)
+                dominance = abs(t_w - v_w)
+                required.append(low_rank * (1.15 + 0.35 * dominance) + 0.15 * high_rank)
+            required.sort()
+            pivot = required[int(0.75 * (len(required) - 1))]
+            return int(self._clamp(round(pivot), 50, min(500, hard_cap)))
+
+        def _agent_finalize_params(
+            trace: List[Dict[str, Any]],
+            cur_text_weight: float,
+            cur_vl_weight: float,
+            cur_total_recall: int,
+        ) -> Dict[str, Any]:
+            if not trace:
+                return {
+                    "text_weight": round(cur_text_weight, 4),
+                    "vl_weight": round(cur_vl_weight, 4),
+                    "recall_size": int(cur_total_recall),
+                    "mode": "fallback",
+                    "reasoning": "no_history",
+                }
+            window = trace[-min(6, len(trace)) :]
+            trend_text = sum(float(row.get("weights", {}).get("text", 0.5)) for row in window) / max(1, len(window))
+            text_vote = 0.0
+            vl_vote = 0.0
+            signs = []
+            for row in window:
+                t_rank = int(row.get("text_rank", 10**9))
+                v_rank = int(row.get("vl_rank", 10**9))
+                confidence = float(row.get("weights", {}).get("text", 0.5))
+                if t_rank < v_rank:
+                    signs.append(1)
+                    text_vote += max(0.2, confidence)
+                elif v_rank < t_rank:
+                    signs.append(-1)
+                    vl_vote += max(0.2, 1.0 - confidence)
+                else:
+                    signs.append(0)
+            switch_count = sum(1 for i in range(1, len(signs)) if signs[i] != 0 and signs[i - 1] != 0 and signs[i] != signs[i - 1])
+            stable = switch_count <= 1
+            vote_total = max(1e-6, text_vote + vl_vote)
+            vote_margin = abs(text_vote - vl_vote) / vote_total
+            if stable and vote_margin >= 0.15:
+                dominant_share = min(0.95, 0.8 + 0.15 * vote_margin)
+                final_text = dominant_share if text_vote >= vl_vote else (1.0 - dominant_share)
+            elif stable and trend_text >= 0.6:
+                final_text = max(0.8, trend_text)
+            elif stable and trend_text <= 0.4:
+                final_text = min(0.2, trend_text)
+            else:
+                final_text = trend_text
+            final_text = float(self._clamp(final_text, 0.05, 0.95))
+            final_vl = 1.0 - final_text
+            return {
+                "text_weight": round(final_text, 4),
+                "vl_weight": round(final_vl, 4),
+                "recall_size": int(cur_total_recall),
+                "mode": "history_agent_update",
+                "reasoning": (
+                    f"trend_text={round(trend_text, 3)}, text_vote={round(text_vote, 3)}, "
+                    f"vl_vote={round(vl_vote, 3)}, margin={round(vote_margin, 3)}, "
+                    f"switches={switch_count}, stable={stable}"
+                ),
+            }
+
         memory: List[Dict[str, Any]] = []
         text_weight = 0.5
         vl_weight = 0.5
+        history_target_text = 0.5
         total_recall = min(500, max(50, int(max_total_recall)))
 
         if not (query or "").strip() or self.query_embedding_model is None:
@@ -895,20 +978,28 @@ class RoutingRecallAgent:
             )
             text_rank = self._rank_of_item(text_ranked, target_item_id)
             vl_rank = self._rank_of_item(vl_ranked, target_item_id)
-            rank_gap = abs(text_rank - vl_rank)
-            delta = self._clamp(rank_gap / 200.0, 0.02, 0.12)
+            text_strength = _rank_strength(text_rank)
+            vl_strength = _rank_strength(vl_rank)
+            strength_sum = max(1e-8, text_strength + vl_strength)
+            strength_target_text = text_strength / strength_sum
+            low_rank = min(_safe_rank(text_rank), _safe_rank(vl_rank))
+            gap = abs(_safe_rank(text_rank) - _safe_rank(vl_rank))
+            confidence = min(1.0, abs(math.log((_safe_rank(vl_rank) + 1) / (_safe_rank(text_rank) + 1))) / 1.6)
+            cover_share = min(0.95, max(0.5, low_rank / max(1.0, float(total_recall))))
+            gap_bonus = min(0.15, math.log1p(gap) / 40.0)
+            dominant_share = min(0.95, max(0.8, cover_share + gap_bonus))
             if text_rank < vl_rank:
-                text_weight = self._clamp(text_weight + delta, 0.1, 0.9)
+                step_target_text = dominant_share
             elif vl_rank < text_rank:
-                text_weight = self._clamp(text_weight - delta, 0.1, 0.9)
+                step_target_text = 1.0 - dominant_share
+            else:
+                step_target_text = 0.5
+            step_target_text = 0.45 * strength_target_text + 0.55 * step_target_text
+            history_target_text = 0.75 * history_target_text + 0.25 * step_target_text
+            max_step_change = 0.05 + 0.07 * confidence
+            step_delta = max(-max_step_change, min(max_step_change, history_target_text - text_weight))
+            text_weight = self._clamp(text_weight + step_delta, 0.05, 0.95)
             vl_weight = 1.0 - text_weight
-
-            finite_ranks = [r for r in [text_rank, vl_rank] if r < 10**9]
-            if finite_ranks:
-                min_rank = min(finite_ranks)
-                max_rank = max(finite_ranks)
-                estimated_k = self._clamp((min_rank + max_rank) * 2, 50, 500)
-                total_recall = int(estimated_k)
 
             memory.append(
                 {
@@ -918,14 +1009,20 @@ class RoutingRecallAgent:
                     "text_rank": text_rank,
                     "vl_rank": vl_rank,
                     "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
-                    "estimated_total_recall": int(total_recall),
                     "summary": (
-                        "text_recall_better" if text_rank < vl_rank else
-                        ("vl_recall_better" if vl_rank < text_rank else "balanced")
+                        f"strength_target={round(strength_target_text, 3)}, "
+                        f"dominant_share={round(dominant_share, 3)}, "
+                        f"confidence={round(confidence, 3)}, "
+                        f"history_target={round(history_target_text, 3)}"
                     ),
                 }
             )
+            total_recall = _estimate_total_recall(memory, int(max_total_recall))
+            memory[-1]["estimated_total_recall"] = int(total_recall)
 
+        agent_final_params = _agent_finalize_params(memory, text_weight, vl_weight, total_recall)
+        text_weight = float(agent_final_params["text_weight"])
+        vl_weight = float(agent_final_params["vl_weight"])
         query_text_emb = self.query_embedding_model.encode(query)
         vl_model = self.vl_query_embedding_model or self.query_embedding_model
         try:
@@ -971,6 +1068,7 @@ class RoutingRecallAgent:
             "text_weight": round(text_weight, 4),
             "vl_weight": round(vl_weight, 4),
             "total_recall": int(min(500, total_recall)),
+            "agent_final_params": agent_final_params,
             "memory": memory,
             "pseudo_query_count": len(pseudo_queries),
         }
