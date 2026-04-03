@@ -360,6 +360,65 @@ def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
     return matrix / np.clip(norms, 1e-12, None)
 
 
+def _repair_qwen3vl_cache_for_missing_ids(
+    qwen3vl_model: Any,
+    cache_path: Path,
+    all_item_ids: List[str],
+    cached_ids: List[str],
+    cached_matrix: np.ndarray,
+    meta_map: Dict[str, Dict[str, Any]],
+    image_url_to_local: Dict[str, str],
+    chunk_size: int,
+) -> Tuple[List[str], np.ndarray]:
+    aligned = min(len(cached_ids), int(cached_matrix.shape[0]))
+    cached_ids = cached_ids[:aligned]
+    cached_matrix = cached_matrix[:aligned]
+    cached_set = set(cached_ids)
+    missing_ids = [iid for iid in all_item_ids if iid not in cached_set]
+    if not missing_ids:
+        return cached_ids, cached_matrix
+
+    print(f"[Agent3][Qwen3VL][repair] missing_ids={len(missing_ids)}; embedding missing only.")
+    missing_embs: List[np.ndarray] = []
+    embedded_ids: List[str] = []
+    step = max(1, int(chunk_size))
+    for start in range(0, len(missing_ids), step):
+        end = min(len(missing_ids), start + step)
+        sub_ids = missing_ids[start:end]
+        sub_inputs = [_build_qwen3vl_item_input(meta_map[iid], image_url_to_local=image_url_to_local) for iid in sub_ids]
+        sub_emb = _tensor_to_float32_numpy(qwen3vl_model.process(sub_inputs))
+        missing_embs.append(sub_emb)
+        embedded_ids.extend(sub_ids)
+        del sub_inputs
+        del sub_emb
+        _cleanup_torch_cache()
+
+    if not missing_embs:
+        return cached_ids, cached_matrix
+
+    cache_map: Dict[str, np.ndarray] = {}
+    for idx, iid in enumerate(cached_ids):
+        if iid not in cache_map:
+            cache_map[iid] = cached_matrix[idx]
+
+    new_emb = np.concatenate(missing_embs, axis=0)
+    for idx, iid in enumerate(embedded_ids):
+        cache_map[iid] = new_emb[idx]
+
+    repaired_ids: List[str] = []
+    repaired_rows: List[np.ndarray] = []
+    for iid in all_item_ids:
+        emb = cache_map.get(iid)
+        if emb is None:
+            continue
+        repaired_ids.append(iid)
+        repaired_rows.append(np.asarray(emb, dtype=np.float32))
+    repaired_matrix = np.stack(repaired_rows, axis=0) if repaired_rows else np.zeros((0, 0), dtype=np.float32)
+    np.savez_compressed(cache_path, item_ids=np.array(repaired_ids), item_embeddings=repaired_matrix)
+    print(f"[Agent3][Qwen3VL][repair] cache updated -> {cache_path}")
+    return repaired_ids, repaired_matrix
+
+
 def _extract_query_keywords(query: str, max_keywords: int) -> List[str]:
     tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", query.lower())
     uniq: List[str] = []
@@ -736,11 +795,18 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             q_npz = np.load(qwen3vl_emb_cache_path, allow_pickle=True)
             q_item_ids_cached = [str(x) for x in q_npz["item_ids"].tolist()]
             q_item_emb_matrix = q_npz["item_embeddings"].astype(np.float32, copy=False)
-        if (
-            q_item_emb_matrix is None
-            or q_item_ids_cached != all_item_ids
-            or int(q_item_emb_matrix.shape[0]) != len(q_item_ids_cached)
-        ):
+            if q_item_emb_matrix is not None:
+                q_item_ids_cached, q_item_emb_matrix = _repair_qwen3vl_cache_for_missing_ids(
+                    qwen3vl_model=qwen3vl_model,
+                    cache_path=qwen3vl_emb_cache_path,
+                    all_item_ids=all_item_ids,
+                    cached_ids=q_item_ids_cached,
+                    cached_matrix=q_item_emb_matrix,
+                    meta_map=meta_map,
+                    image_url_to_local=image_url_to_local,
+                    chunk_size=max(1, int(args.agent3_qwen3vl_chunk_size)),
+                )
+        if q_item_emb_matrix is None:
             q_item_emb_matrix = _build_qwen3vl_item_embedding_cache(
                 qwen3vl_model=qwen3vl_model,
                 all_item_ids=all_item_ids,
@@ -750,7 +816,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 save_every_items=max(1, int(args.agent3_qwen3vl_save_every)),
                 image_url_to_local=image_url_to_local,
             )
+            q_item_ids_cached = list(all_item_ids)
+        elif q_item_ids_cached != all_item_ids:
+            print(
+                "[Agent3][Qwen3VL] cache still partial after repair; "
+                "skip full rebuild and use available embedded subset only."
+            )
         qwen3vl_item_emb_norm = _l2_normalize(q_item_emb_matrix)
+        qwen3vl_item_id_to_index = {iid: idx for idx, iid in enumerate(q_item_ids_cached)}
     global_db = GlobalItemDB(args.global_db)
     history_db = UserHistoryLogDB(args.history_db)
     vl_extractor = Qwen3VLExtractor(model_name=args.vl_model) if args.enable_vl_profiling else None
@@ -815,17 +888,25 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 qwen3vl_query_input["image"] = query_image
             qwen3vl_q_emb = _tensor_to_float32_numpy(qwen3vl_model.process([qwen3vl_query_input]))
             qwen3vl_q_emb_norm = _l2_normalize(qwen3vl_q_emb)[0]
-            q_filtered_emb = qwen3vl_item_emb_norm[np.array(filtered_idx)]
-            qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
-            qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
-            mm_topk = max(1, int(args.agent3_qwen3vl_topk))
-            qwen3vl_ids = [filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
-            top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
-            used_k = len(top_ids)
-            kw_debug["qwen3vl_enabled"] = True
-            kw_debug["qwen3vl_topk"] = mm_topk
-            kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
-            kw_debug["merged_pool_size"] = len(top_ids)
+            qwen_filtered_item_ids = [iid for iid in filtered_item_ids if iid in qwen3vl_item_id_to_index]
+            if not qwen_filtered_item_ids:
+                kw_debug["qwen3vl_enabled"] = False
+                kw_debug["qwen3vl_reason"] = "no_embedded_items_in_filtered_pool"
+                qwen3vl_rank_indices = None
+            else:
+                qwen_filtered_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_filtered_item_ids]
+                q_filtered_emb = qwen3vl_item_emb_norm[np.array(qwen_filtered_idx)]
+                qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
+                qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
+                mm_topk = max(1, int(args.agent3_qwen3vl_topk))
+                qwen3vl_ids = [qwen_filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
+                top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
+                used_k = len(top_ids)
+                kw_debug["qwen3vl_enabled"] = True
+                kw_debug["qwen3vl_topk"] = mm_topk
+                kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
+                kw_debug["qwen3vl_embedded_pool_size"] = len(qwen_filtered_item_ids)
+                kw_debug["merged_pool_size"] = len(top_ids)
         else:
             kw_debug["qwen3vl_enabled"] = False
         history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
