@@ -21,8 +21,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Sequence, Set, Tuple
 
-from run_full_agents_pipeline import build_argparser as build_full_argparser
-from run_full_agents_pipeline import run_pipeline
+try:
+    from adaptive_pipe.run_full_agents_pipeline import build_argparser as build_full_argparser
+    from adaptive_pipe.run_full_agents_pipeline import run_pipeline
+except ModuleNotFoundError:
+    from run_full_agents_pipeline import build_argparser as build_full_argparser
+    from run_full_agents_pipeline import run_pipeline
 
 
 @dataclass
@@ -687,6 +691,7 @@ def main(args: argparse.Namespace) -> None:
             max_candidate_items=int(args.max_candidate_items),
             max_history_rows=int(args.max_history_rows),
             top_n=int(args.top_n),
+            groundtruth_target_item_id=str(selected_positive),
             positive_history_only=bool(args.positive_history_only),
             disable_must_have=bool(args.disable_must_have),
             disable_prediction_bonus=bool(args.disable_prediction_bonus),
