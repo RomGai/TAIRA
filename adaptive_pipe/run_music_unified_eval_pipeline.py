@@ -635,22 +635,20 @@ def _adaptive_embedding_fusion(
                 "reasoning": "no_history",
             }
         window = history[-min(6, len(history)) :]
-        trend_weights = [(idx + 1) for idx in range(len(window))]
-        trend_sum = float(sum(trend_weights))
-        trend_text = sum(w * float(row.get("weights", {}).get("text", 0.5)) for w, row in zip(trend_weights, window)) / trend_sum
+        trend_text = sum(float(row.get("weights", {}).get("text", 0.5)) for row in window) / max(1, len(window))
         text_vote = 0.0
         vl_vote = 0.0
         signs = []
-        for idx, row in enumerate(window, start=1):
+        for row in window:
             t_rank = int(row.get("text_rank", 10**9))
             v_rank = int(row.get("vl_rank", 10**9))
             confidence = float(row.get("weights", {}).get("text", 0.5))
             if t_rank < v_rank:
                 signs.append(1)
-                text_vote += idx * max(0.2, confidence)
+                text_vote += max(0.2, confidence)
             elif v_rank < t_rank:
                 signs.append(-1)
-                vl_vote += idx * max(0.2, 1.0 - confidence)
+                vl_vote += max(0.2, 1.0 - confidence)
             else:
                 signs.append(0)
         switch_count = sum(1 for i in range(1, len(signs)) if signs[i] != 0 and signs[i - 1] != 0 and signs[i] != signs[i - 1])
