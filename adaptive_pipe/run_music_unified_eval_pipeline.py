@@ -814,7 +814,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             max_workers=max(1, int(args.agent3_qwen3vl_prefetch_workers)),
             timeout_sec=max(1, int(args.agent3_qwen3vl_prefetch_timeout)),
         )
-        qwen3vl_model = Qwen3VLEmbedder(model_name_or_path=args.agent3_qwen3vl_model)
+        qwen3vl_model = Qwen3VLEmbedder(
+            model_name_or_path=args.agent3_qwen3vl_model,
+            min_pixels=max(1, int(args.agent3_qwen3vl_min_pixels)),
+            max_pixels=max(1, int(args.agent3_qwen3vl_max_pixels)),
+        )
         q_item_ids_cached: List[str] = []
         q_item_emb_matrix: np.ndarray | None = None
         if qwen3vl_emb_cache_path.exists():
@@ -1096,6 +1100,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-agent3-qwen3vl-embedding", action="store_true", help="开启后，Agent3新增一路Qwen3-VL多模态embedding召回（文本+图片）。默认关闭。")
     parser.add_argument("--agent3-qwen3vl-topk", type=int, default=25, help="Agent3新增Qwen3-VL多模态embedding召回Top-K。")
     parser.add_argument("--agent3-qwen3vl-model", default="Qwen/Qwen3-VL-Embedding-2B", help="Agent3多模态embedding模型名称。")
+    parser.add_argument("--agent3-qwen3vl-min-pixels", type=int, default=4096, help="Qwen3-VL输入图最小像素约束。")
+    parser.add_argument("--agent3-qwen3vl-max-pixels", type=int, default=1048576, help="Qwen3-VL输入图最大像素约束；过大图片会被压到该预算。")
     parser.add_argument("--agent3-qwen3vl-chunk-size", type=int, default=100, help="Qwen3-VL多模态embedding建库分块大小（默认100）。")
     parser.add_argument("--agent3-qwen3vl-save-every", type=int, default=1000, help="Qwen3-VL embedding每累计多少条落盘一次part文件，最后再合并。")
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
