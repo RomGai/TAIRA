@@ -571,6 +571,7 @@ def run_module3(
     query = str(intent_dual_recall_output.get("query", ""))
     user_id = str(intent_dual_recall_output.get("user_id", ""))
     candidate_items = list(intent_dual_recall_output.get("candidate_items", []))
+    original_agent3_candidate_items = list(candidate_items)
     history_rows = list(intent_dual_recall_output.get("query_relevant_history", []))
 
     reasoner = DynamicPreferenceReasonerAgent(
@@ -584,6 +585,7 @@ def run_module3(
     )
 
     collaborative_items: List[Dict[str, Any]] = []
+    target_item_id = str(groundtruth_target_item_id or "").strip()
     if enable_collaborative_signal and (query or "").strip():
         emb_model = Qwen3EmbeddingModel(model_name=collaborative_embedding_model_name)
         store = CollaborativeSignalStore(db_path=collaborative_db_path)
@@ -604,6 +606,29 @@ def run_module3(
 
         store.upsert_user_embedding(user_id=user_id, reasoning_text=constraints.reasoning, embedding=reasoning_embedding)
         store.upsert_history_items(user_id=user_id, history_rows=history_rows)
+
+    if target_item_id:
+        in_agent3 = any(str(x.get("item_id", "")).strip() == target_item_id for x in original_agent3_candidate_items)
+        in_agent4_collab = any(str(x.get("item_id", "")).strip() == target_item_id for x in collaborative_items)
+        if (not in_agent3) and (not in_agent4_collab):
+            output = Module3Output(
+                user_id=user_id,
+                query=query,
+                preference_constraints=constraints.to_dict(),
+                ranked_items=[],
+                groundtruth_target_item_id=target_item_id,
+            )
+            output.preference_constraints["skip_rerank_reason"] = (
+                "target_item_missing_in_agent3_and_agent4_recall"
+            )
+            if save_output:
+                output_path = Path(output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    json.dumps(output.to_dict(), ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            return output
 
     if disable_must_avoid:
         constraints.must_avoid = []

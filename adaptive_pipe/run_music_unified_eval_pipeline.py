@@ -21,6 +21,17 @@ except Exception:  # pragma: no cover
     torch = None
 
 try:
+    from adaptive_pipe.dynamic_reasoning_ranking_agent import run_module3
+    from adaptive_pipe.image_prefetch import prefetch_item_images
+    from adaptive_pipe.item_profiler_agents import (
+        GlobalItemDB,
+        HistoryItemProfileInput,
+        ItemProfileInput,
+        Qwen3VLExtractor,
+        UserHistoryLogDB,
+    )
+    from adaptive_pipe.intent_dual_recall_agent import Qwen3RouterLLM
+except ModuleNotFoundError:
     from dynamic_reasoning_ranking_agent import run_module3
     from image_prefetch import prefetch_item_images
     from item_profiler_agents import (
@@ -31,19 +42,6 @@ try:
         UserHistoryLogDB,
     )
     from intent_dual_recall_agent import Qwen3RouterLLM
-    from qwen3_vl_embedding import Qwen3VLEmbedder
-except ModuleNotFoundError:
-    from new_pipe.dynamic_reasoning_ranking_agent import run_module3
-    from new_pipe.image_prefetch import prefetch_item_images
-    from new_pipe.item_profiler_agents import (
-        GlobalItemDB,
-        HistoryItemProfileInput,
-        ItemProfileInput,
-        Qwen3VLExtractor,
-        UserHistoryLogDB,
-    )
-    from new_pipe.intent_dual_recall_agent import Qwen3RouterLLM
-    from new_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
 
 EN_STOPWORDS = {
     "a", "an", "the", "and", "or", "to", "for", "with", "of", "in", "on", "at", "from", "by",
@@ -137,6 +135,12 @@ def _safe_json_load(path: Path, default: Any) -> Any:
 def _save_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _route_query(query: str, category_catalog: List[str], enable_llm: bool, text_model: str) -> Dict[str, Any]:
@@ -326,7 +330,7 @@ def _build_item_embedding_cache(
 
 
 def _build_qwen3vl_item_embedding_cache(
-    qwen3vl_model: Qwen3VLEmbedder,
+    qwen3vl_model: Any,
     all_item_ids: List[str],
     meta_map: Dict[str, Dict[str, Any]],
     emb_cache_path: Path,
@@ -339,14 +343,46 @@ def _build_qwen3vl_item_embedding_cache(
     emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
     parts_dir = emb_cache_path.parent / f"{emb_cache_path.stem}_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
-    for old_part in sorted(parts_dir.glob("part_*.npz")):
-        old_part.unlink()
-
     pending_ids: List[str] = []
     pending_emb_chunks: List[np.ndarray] = []
     saved_part_paths: List[Path] = []
     processed = 0
     part_idx = 0
+    resume_offset = 0
+
+    existing_parts = sorted(parts_dir.glob("part_*.npz"))
+    if existing_parts:
+        print(f"[Agent3][Qwen3VL] found existing part files: {len(existing_parts)}")
+        resume_ok = True
+        for part_path in existing_parts:
+            m = re.search(r"part_(\d+)\.npz$", part_path.name)
+            if m:
+                part_idx = max(part_idx, int(m.group(1)))
+            part_npz = np.load(part_path, allow_pickle=True)
+            part_ids = [str(x) for x in part_npz["item_ids"].tolist()]
+            expected_ids = all_item_ids[resume_offset : resume_offset + len(part_ids)]
+            if part_ids != expected_ids:
+                print(
+                    f"[Agent3][Qwen3VL][resume] mismatch at {part_path.name}; "
+                    "clear old parts and rebuild from scratch."
+                )
+                resume_ok = False
+                break
+            saved_part_paths.append(part_path)
+            resume_offset += len(part_ids)
+
+        if not resume_ok:
+            for old_part in existing_parts:
+                old_part.unlink()
+            saved_part_paths = []
+            part_idx = 0
+            resume_offset = 0
+        elif resume_offset > 0:
+            processed = resume_offset
+            print(
+                f"[Agent3][Qwen3VL][resume] skip processed rows={resume_offset}, "
+                f"continue from index={resume_offset}."
+            )
 
     def _flush_pending() -> None:
         nonlocal part_idx, pending_ids, pending_emb_chunks
@@ -360,8 +396,9 @@ def _build_qwen3vl_item_embedding_cache(
         print(f"[Agent3][Qwen3VL][part save] {part_path.name} rows={len(pending_ids)}")
         pending_ids = []
         pending_emb_chunks = []
+        _cleanup_torch_cache()
 
-    for start in range(0, total, chunk_size):
+    for start in range(resume_offset, total, chunk_size):
         end = min(total, start + chunk_size)
         chunk_item_ids = all_item_ids[start:end]
         chunk_inputs = [_build_qwen3vl_item_input(meta_map[iid], image_url_to_local=image_url_to_local) for iid in chunk_item_ids]
@@ -370,16 +407,27 @@ def _build_qwen3vl_item_embedding_cache(
         pending_ids.extend(chunk_item_ids)
         processed = end
         print(f"[Agent3][Qwen3VL][embedding chunk] {processed}/{total} (chunk={start}-{end})")
+        del chunk_inputs
+        del chunk_emb
         if len(pending_ids) >= max(1, int(save_every_items)):
             _flush_pending()
+        else:
+            _cleanup_torch_cache()
 
     _flush_pending()
     if not saved_part_paths:
         raise ValueError("Failed to build Qwen3-VL embedding cache: no parts saved.")
 
-    all_parts = [np.load(p, allow_pickle=True)["item_embeddings"].astype(np.float32, copy=False) for p in saved_part_paths]
+    all_part_ids: List[str] = []
+    all_parts: List[np.ndarray] = []
+    for p in saved_part_paths:
+        part_npz = np.load(p, allow_pickle=True)
+        part_ids = [str(x) for x in part_npz["item_ids"].tolist()]
+        part_emb = part_npz["item_embeddings"].astype(np.float32, copy=False)
+        all_part_ids.extend(part_ids)
+        all_parts.append(part_emb)
     final_emb = np.concatenate(all_parts, axis=0)
-    np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids), item_embeddings=final_emb)
+    np.savez_compressed(emb_cache_path, item_ids=np.array(all_part_ids), item_embeddings=final_emb)
     for p in saved_part_paths:
         p.unlink()
     if parts_dir.exists() and not any(parts_dir.iterdir()):
@@ -391,6 +439,65 @@ def _build_qwen3vl_item_embedding_cache(
 def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return matrix / np.clip(norms, 1e-12, None)
+
+
+def _repair_qwen3vl_cache_for_missing_ids(
+    qwen3vl_model: Any,
+    cache_path: Path,
+    all_item_ids: List[str],
+    cached_ids: List[str],
+    cached_matrix: np.ndarray,
+    meta_map: Dict[str, Dict[str, Any]],
+    image_url_to_local: Dict[str, str],
+    chunk_size: int,
+) -> Tuple[List[str], np.ndarray]:
+    aligned = min(len(cached_ids), int(cached_matrix.shape[0]))
+    cached_ids = cached_ids[:aligned]
+    cached_matrix = cached_matrix[:aligned]
+    cached_set = set(cached_ids)
+    missing_ids = [iid for iid in all_item_ids if iid not in cached_set]
+    if not missing_ids:
+        return cached_ids, cached_matrix
+
+    print(f"[Agent3][Qwen3VL][repair] missing_ids={len(missing_ids)}; embedding missing only.")
+    missing_embs: List[np.ndarray] = []
+    embedded_ids: List[str] = []
+    step = max(1, int(chunk_size))
+    for start in range(0, len(missing_ids), step):
+        end = min(len(missing_ids), start + step)
+        sub_ids = missing_ids[start:end]
+        sub_inputs = [_build_qwen3vl_item_input(meta_map[iid], image_url_to_local=image_url_to_local) for iid in sub_ids]
+        sub_emb = _tensor_to_float32_numpy(qwen3vl_model.process(sub_inputs))
+        missing_embs.append(sub_emb)
+        embedded_ids.extend(sub_ids)
+        del sub_inputs
+        del sub_emb
+        _cleanup_torch_cache()
+
+    if not missing_embs:
+        return cached_ids, cached_matrix
+
+    cache_map: Dict[str, np.ndarray] = {}
+    for idx, iid in enumerate(cached_ids):
+        if iid not in cache_map:
+            cache_map[iid] = cached_matrix[idx]
+
+    new_emb = np.concatenate(missing_embs, axis=0)
+    for idx, iid in enumerate(embedded_ids):
+        cache_map[iid] = new_emb[idx]
+
+    repaired_ids: List[str] = []
+    repaired_rows: List[np.ndarray] = []
+    for iid in all_item_ids:
+        emb = cache_map.get(iid)
+        if emb is None:
+            continue
+        repaired_ids.append(iid)
+        repaired_rows.append(np.asarray(emb, dtype=np.float32))
+    repaired_matrix = np.stack(repaired_rows, axis=0) if repaired_rows else np.zeros((0, 0), dtype=np.float32)
+    np.savez_compressed(cache_path, item_ids=np.array(repaired_ids), item_embeddings=repaired_matrix)
+    print(f"[Agent3][Qwen3VL][repair] cache updated -> {cache_path}")
+    return repaired_ids, repaired_matrix
 
 
 def _extract_query_keywords(query: str, max_keywords: int) -> List[str]:
@@ -423,8 +530,8 @@ def _build_hybrid_recall_ids(
     keyword_recall_topk: int,
     embedding_recall_topk: int,
 ) -> Tuple[List[str], int, Dict[str, Any]]:
-    keyword_topk = max(1, int(keyword_recall_topk))
-    embedding_topk = max(1, int(embedding_recall_topk))
+    keyword_topk = max(0, int(keyword_recall_topk))
+    embedding_topk = max(0, int(embedding_recall_topk))
 
     matched_scored: List[Tuple[int, str, List[str]]] = []
     for iid in all_item_ids:
@@ -432,11 +539,12 @@ def _build_hybrid_recall_ids(
         if score > 0:
             matched_scored.append((score, iid, matched))
     matched_scored.sort(key=lambda x: (-x[0], x[1]))
-    matched_ids = [x[1] for x in matched_scored[:keyword_topk]]
+    matched_ids = [x[1] for x in matched_scored[:keyword_topk]] if keyword_topk > 0 else []
 
     embedding_ids: List[str] = []
-    for idx in rank_indices[:embedding_topk]:
-        embedding_ids.append(all_item_ids[int(idx)])
+    if embedding_topk > 0:
+        for idx in rank_indices[:embedding_topk]:
+            embedding_ids.append(all_item_ids[int(idx)])
 
     merged_ids: List[str] = []
     seen = set()
@@ -469,6 +577,74 @@ def _merge_unique_ids(*id_lists: List[str]) -> List[str]:
             seen.add(iid)
             merged.append(iid)
     return merged
+
+
+def _rank_position_map(rank_indices: np.ndarray, item_ids: List[str]) -> Dict[str, int]:
+    pos: Dict[str, int] = {}
+    for rank, idx in enumerate(rank_indices, start=1):
+        item_id = item_ids[int(idx)]
+        if item_id not in pos:
+            pos[item_id] = rank
+    return pos
+
+
+def _adaptive_embedding_fusion(
+    history_ids: List[str],
+    filtered_item_ids: List[str],
+    text_rank_indices: np.ndarray,
+    qwen3vl_rank_indices: np.ndarray | None,
+    max_total_recall: int = 500,
+    max_pseudo_queries: int = 8,
+) -> Tuple[List[str], Dict[str, Any]]:
+    text_weight = 0.5
+    vl_weight = 0.5
+    total_k = int(max(50, min(500, max_total_recall)))
+    memory: List[Dict[str, Any]] = []
+
+    if qwen3vl_rank_indices is None:
+        top_ids = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:total_k]]
+        return top_ids, {"enabled": False, "reason": "qwen3vl_unavailable", "memory": memory}
+
+    text_rank_map = _rank_position_map(text_rank_indices, filtered_item_ids)
+    vl_rank_map = _rank_position_map(qwen3vl_rank_indices, filtered_item_ids)
+    pseudo_targets = [iid for iid in history_ids if iid in text_rank_map][: max(1, int(max_pseudo_queries))]
+    for step, iid in enumerate(pseudo_targets, start=1):
+        text_rank = text_rank_map.get(iid, 10**9)
+        vl_rank = vl_rank_map.get(iid, 10**9)
+        gap = abs(text_rank - vl_rank)
+        delta = max(0.02, min(0.12, gap / 200.0))
+        if text_rank < vl_rank:
+            text_weight = max(0.1, min(0.9, text_weight + delta))
+        elif vl_rank < text_rank:
+            text_weight = max(0.1, min(0.9, text_weight - delta))
+        vl_weight = 1.0 - text_weight
+        finite_ranks = [r for r in [text_rank, vl_rank] if r < 10**9]
+        if finite_ranks:
+            total_k = int(max(50, min(500, (min(finite_ranks) + max(finite_ranks)) * 2)))
+        memory.append(
+            {
+                "step": step,
+                "target_item_id": iid,
+                "text_rank": int(text_rank),
+                "vl_rank": int(vl_rank),
+                "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
+                "estimated_total_recall": int(total_k),
+            }
+        )
+
+    text_k = max(1, int(round(total_k * text_weight)))
+    vl_k = max(1, int(round(total_k * vl_weight)))
+    text_ids = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:text_k]]
+    vl_ids = [filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:vl_k]]
+    fused = _merge_unique_ids(text_ids, vl_ids)[: min(500, total_k)]
+    return fused, {
+        "enabled": True,
+        "text_weight": round(text_weight, 4),
+        "vl_weight": round(vl_weight, 4),
+        "total_recall": int(min(500, total_k)),
+        "pseudo_query_count": len(pseudo_targets),
+        "memory": memory,
+    }
 
 
 def _filter_item_ids_by_categories(
@@ -697,6 +873,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     qwen3vl_model = None
     qwen3vl_item_emb_norm: np.ndarray | None = None
     if args.enable_agent3_qwen3vl_embedding:
+        try:
+            from adaptive_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
+        except ModuleNotFoundError:
+            from qwen3_vl_embedding import Qwen3VLEmbedder
         print(f"[Init] load multimodal embedding model: {args.agent3_qwen3vl_model}")
         image_cache_dir = cache_dir / "agent3_qwen3vl_images"
         image_url_to_local = prefetch_item_images(
@@ -706,14 +886,29 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             max_workers=max(1, int(args.agent3_qwen3vl_prefetch_workers)),
             timeout_sec=max(1, int(args.agent3_qwen3vl_prefetch_timeout)),
         )
-        qwen3vl_model = Qwen3VLEmbedder(model_name_or_path=args.agent3_qwen3vl_model)
+        qwen3vl_model = Qwen3VLEmbedder(
+            model_name_or_path=args.agent3_qwen3vl_model,
+            min_pixels=max(1, int(args.agent3_qwen3vl_min_pixels)),
+            max_pixels=max(1, int(args.agent3_qwen3vl_max_pixels)),
+        )
         q_item_ids_cached: List[str] = []
         q_item_emb_matrix: np.ndarray | None = None
         if qwen3vl_emb_cache_path.exists():
             q_npz = np.load(qwen3vl_emb_cache_path, allow_pickle=True)
             q_item_ids_cached = [str(x) for x in q_npz["item_ids"].tolist()]
             q_item_emb_matrix = q_npz["item_embeddings"].astype(np.float32, copy=False)
-        if q_item_emb_matrix is None or q_item_ids_cached != all_item_ids:
+            if q_item_emb_matrix is not None:
+                q_item_ids_cached, q_item_emb_matrix = _repair_qwen3vl_cache_for_missing_ids(
+                    qwen3vl_model=qwen3vl_model,
+                    cache_path=qwen3vl_emb_cache_path,
+                    all_item_ids=all_item_ids,
+                    cached_ids=q_item_ids_cached,
+                    cached_matrix=q_item_emb_matrix,
+                    meta_map=meta_map,
+                    image_url_to_local=image_url_to_local,
+                    chunk_size=max(1, int(args.agent3_qwen3vl_chunk_size)),
+                )
+        if q_item_emb_matrix is None:
             q_item_emb_matrix = _build_qwen3vl_item_embedding_cache(
                 qwen3vl_model=qwen3vl_model,
                 all_item_ids=all_item_ids,
@@ -723,13 +918,23 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 save_every_items=max(1, int(args.agent3_qwen3vl_save_every)),
                 image_url_to_local=image_url_to_local,
             )
+            q_item_ids_cached = list(all_item_ids)
+        elif q_item_ids_cached != all_item_ids:
+            print(
+                "[Agent3][Qwen3VL] cache still partial after repair; "
+                "skip full rebuild and use available embedded subset only."
+            )
         qwen3vl_item_emb_norm = _l2_normalize(q_item_emb_matrix)
+        qwen3vl_item_id_to_index = {iid: idx for idx, iid in enumerate(q_item_ids_cached)}
     global_db = GlobalItemDB(args.global_db)
     history_db = UserHistoryLogDB(args.history_db)
     vl_extractor = Qwen3VLExtractor(model_name=args.vl_model) if args.enable_vl_profiling else None
 
     category_catalog = sorted({_meta_category_text(v) for v in meta_map.values() if _meta_category_text(v)})
     results: List[Dict[str, Any]] = []
+    modal_trace_path = Path(args.output_dir) / "agent3_modal_modulation_trace.jsonl"
+    if modal_trace_path.exists():
+        modal_trace_path.unlink()
 
     for row_idx, row in query_df.iterrows():
         user_id = str(row["user_id"])
@@ -803,14 +1008,20 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         rank_indices = np.argsort(-sim_matrix)
 
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
+        hybrid_embedding_topk = (
+            0
+            if bool(getattr(args, "enable_agent3_adaptive_weighting", False))
+            else int(args.agent3_embedding_topk)
+        )
         top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
             all_item_ids=filtered_item_ids,
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
             keyword_recall_topk=args.agent3_keyword_topk,
-            embedding_recall_topk=args.agent3_embedding_topk,
+            embedding_recall_topk=hybrid_embedding_topk,
         )
+        qwen3vl_rank_indices = None
         qwen3vl_ids: List[str] = []
         if args.enable_agent3_qwen3vl_embedding and qwen3vl_model is not None and qwen3vl_item_emb_norm is not None:
             qwen3vl_query_input = {"text": q_sentence}
@@ -821,19 +1032,69 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 qwen3vl_query_input["image"] = query_image
             qwen3vl_q_emb = _tensor_to_float32_numpy(qwen3vl_model.process([qwen3vl_query_input]))
             qwen3vl_q_emb_norm = _l2_normalize(qwen3vl_q_emb)[0]
-            q_filtered_emb = qwen3vl_item_emb_norm[np.array(filtered_idx)]
-            qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
-            qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
-            mm_topk = max(1, int(args.agent3_qwen3vl_topk))
-            qwen3vl_ids = [filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
-            top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
-            used_k = len(top_ids)
-            kw_debug["qwen3vl_enabled"] = True
-            kw_debug["qwen3vl_topk"] = mm_topk
-            kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
-            kw_debug["merged_pool_size"] = len(top_ids)
+            qwen_filtered_item_ids = [iid for iid in filtered_item_ids if iid in qwen3vl_item_id_to_index]
+            if not qwen_filtered_item_ids:
+                kw_debug["qwen3vl_enabled"] = False
+                kw_debug["qwen3vl_reason"] = "no_embedded_items_in_filtered_pool"
+                qwen3vl_rank_indices = None
+                qwen3vl_ids = []
+            else:
+                qwen_filtered_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_filtered_item_ids]
+                q_filtered_emb = qwen3vl_item_emb_norm[np.array(qwen_filtered_idx)]
+                qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
+                qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
+                mm_topk = max(1, int(args.agent3_qwen3vl_topk))
+                qwen3vl_ids = [qwen_filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
+                top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
+                used_k = len(top_ids)
+                kw_debug["qwen3vl_enabled"] = True
+                kw_debug["qwen3vl_topk"] = mm_topk
+                kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
+                kw_debug["qwen3vl_embedded_pool_size"] = len(qwen_filtered_item_ids)
+                kw_debug["merged_pool_size"] = len(top_ids)
         else:
             kw_debug["qwen3vl_enabled"] = False
+        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
+        if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
+            adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
+                history_ids=history_ids,
+                filtered_item_ids=filtered_item_ids,
+                text_rank_indices=rank_indices,
+                qwen3vl_rank_indices=qwen3vl_rank_indices,
+                max_total_recall=int(getattr(args, "agent3_adaptive_max_total_recall", 500)),
+                max_pseudo_queries=int(getattr(args, "agent3_adaptive_max_pseudo_queries", 8)),
+            )
+            top_ids = _merge_unique_ids(top_ids, adaptive_ids)
+            used_k = len(top_ids)
+            kw_debug["adaptive_embedding_state"] = adaptive_state
+        adaptive_state = kw_debug.get("adaptive_embedding_state", {}) if isinstance(kw_debug, dict) else {}
+        if isinstance(adaptive_state, dict) and adaptive_state.get("enabled"):
+            modal_params = {
+                "text_weight": float(adaptive_state.get("text_weight", 0.5)),
+                "vl_weight": float(adaptive_state.get("vl_weight", 0.5)),
+                "recall_size": int(adaptive_state.get("total_recall", len(top_ids))),
+                "source": "adaptive",
+            }
+        else:
+            text_pool = int(kw_debug.get("embedding_pool_size", 0))
+            vl_pool = int(kw_debug.get("qwen3vl_pool_size", 0))
+            denom = max(1, text_pool + vl_pool)
+            modal_params = {
+                "text_weight": float(text_pool / denom),
+                "vl_weight": float(vl_pool / denom),
+                "recall_size": int(kw_debug.get("merged_pool_size", len(top_ids))),
+                "source": "pool_ratio",
+            }
+        kw_debug["modal_modulation_params"] = modal_params
+        _append_jsonl(
+            modal_trace_path,
+            {
+                "user_id": user_id,
+                "target_id": target_id,
+                "query": query,
+                "modal_modulation_params": modal_params,
+            },
+        )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
             f"stage={kw_debug['keyword_stage']} prefilter_size={len(filtered_item_ids)}"
@@ -878,7 +1139,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 print(f"[Agent1] {i}/{len(top_ids)}")
 
         history_rows: List[Dict[str, Any]] = []
-        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
         for i, iid in enumerate(history_ids, start=1):
             meta = meta_map.get(iid)
             if meta is None:
@@ -970,10 +1230,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-agent3-qwen3vl-embedding", action="store_true", help="开启后，Agent3新增一路Qwen3-VL多模态embedding召回（文本+图片）。默认关闭。")
     parser.add_argument("--agent3-qwen3vl-topk", type=int, default=25, help="Agent3新增Qwen3-VL多模态embedding召回Top-K。")
     parser.add_argument("--agent3-qwen3vl-model", default="Qwen/Qwen3-VL-Embedding-2B", help="Agent3多模态embedding模型名称。")
-    parser.add_argument("--agent3-qwen3vl-chunk-size", type=int, default=256, help="Qwen3-VL多模态embedding建库分块大小。")
+    parser.add_argument("--agent3-qwen3vl-min-pixels", type=int, default=4096, help="Qwen3-VL输入图最小像素约束。")
+    parser.add_argument("--agent3-qwen3vl-max-pixels", type=int, default=1048576, help="Qwen3-VL输入图最大像素约束；过大图片会被压到该预算。")
+    parser.add_argument("--agent3-qwen3vl-chunk-size", type=int, default=100, help="Qwen3-VL多模态embedding建库分块大小（默认100）。")
     parser.add_argument("--agent3-qwen3vl-save-every", type=int, default=1000, help="Qwen3-VL embedding每累计多少条落盘一次part文件，最后再合并。")
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
+    parser.add_argument("--enable-agent3-adaptive-weighting", action="store_true", help="开启Agent3基于历史伪查询的text/vl自适应权重迭代。")
+    parser.add_argument("--agent3-adaptive-max-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量上限（<=500）。")
+    parser.add_argument("--agent3-adaptive-max-pseudo-queries", type=int, default=8, help="Agent3每次最多使用多少历史商品构造伪查询。")
     parser.add_argument(
         "--agent3-skip-category-prefilter",
         action="store_true",
