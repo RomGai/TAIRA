@@ -22,16 +22,28 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from item_profiler_agents import (
-    HistoryItemProfileInput,
-    ItemProfileInput,
-    _build_user_item_timestamp_map,
-    _export_sqlite_table_as_jsonl,
-    _write_jsonl,
-    bootstrap_agents_from_processed,
-    expand_pos_neg_rows,
-    load_item_desc_tsv,
-)
+try:
+    from adaptive_pipe.item_profiler_agents import (
+        HistoryItemProfileInput,
+        ItemProfileInput,
+        _build_user_item_timestamp_map,
+        _export_sqlite_table_as_jsonl,
+        _write_jsonl,
+        bootstrap_agents_from_processed,
+        expand_pos_neg_rows,
+        load_item_desc_tsv,
+    )
+except ModuleNotFoundError:
+    from item_profiler_agents import (
+        HistoryItemProfileInput,
+        ItemProfileInput,
+        _build_user_item_timestamp_map,
+        _export_sqlite_table_as_jsonl,
+        _write_jsonl,
+        bootstrap_agents_from_processed,
+        expand_pos_neg_rows,
+        load_item_desc_tsv,
+    )
 
 
 def _collect_all_labeled_history_rows(
@@ -133,7 +145,10 @@ def _build_user_sample_progress(rows: List[Dict[str, Any]]) -> Dict[str, Dict[st
 
 
 def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
-    from intent_dual_recall_agent import GlobalHistoryAccessor, Qwen3RouterLLM, RoutingRecallAgent
+    try:
+        from adaptive_pipe.intent_dual_recall_agent import GlobalHistoryAccessor, Qwen3RouterLLM, RoutingRecallAgent
+    except ModuleNotFoundError:
+        from intent_dual_recall_agent import GlobalHistoryAccessor, Qwen3RouterLLM, RoutingRecallAgent
 
     item_map = load_item_desc_tsv(args.item_desc_tsv)
     fallback_item_map: Dict[str, Dict[str, str]] = {}
@@ -325,7 +340,10 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     # Agent 4+5: iterate every agent3 output file automatically
-    from dynamic_reasoning_ranking_agent import run_module3
+    try:
+        from adaptive_pipe.dynamic_reasoning_ranking_agent import run_module3
+    except ModuleNotFoundError:
+        from dynamic_reasoning_ranking_agent import run_module3
 
     intent_outputs = _list_saved_agent3_outputs(args.intent_output_dir)
     print(f"[Agent 4/5] Running module-3 for all agent3 outputs: {len(intent_outputs)}")

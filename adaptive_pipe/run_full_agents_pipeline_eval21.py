@@ -21,8 +21,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Sequence, Set, Tuple
 
-from run_full_agents_pipeline import build_argparser as build_full_argparser
-from run_full_agents_pipeline import run_pipeline
+try:
+    from adaptive_pipe.run_full_agents_pipeline import build_argparser as build_full_argparser
+    from adaptive_pipe.run_full_agents_pipeline import run_pipeline
+except ModuleNotFoundError:
+    from run_full_agents_pipeline import build_argparser as build_full_argparser
+    from run_full_agents_pipeline import run_pipeline
 
 
 @dataclass
