@@ -1124,9 +1124,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
 
+        query_recall_pool_mode = str(getattr(args, "agent3_query_recall_pool", "filtered")).strip().lower()
         if args.agent3_skip_category_prefilter:
+            query_recall_pool_mode = "full"
+        if query_recall_pool_mode == "full":
             filtered_item_ids = all_item_ids
-            print(f"[Agent3][categories] skip exact-match prefilter; candidate_count={len(filtered_item_ids)}")
+            print(f"[Agent3][categories] query_recall_pool=full candidate_count={len(filtered_item_ids)}")
         else:
             filtered_item_ids = _filter_item_ids_by_categories(
                 candidate_item_ids=all_item_ids,
@@ -1426,6 +1429,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
     parser.add_argument("--enable-agent3-adaptive-weighting", action="store_true", help="开启Agent3基于历史伪查询的text/vl自适应权重迭代。")
+    parser.add_argument(
+        "--agent3-query-recall-pool",
+        choices=["filtered", "full"],
+        default="filtered",
+        help="控制真实query召回候选池：filtered=categories过滤后；full=全库。",
+    )
     parser.add_argument("--agent3-adaptive-min-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量下限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量上限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-pseudo-queries", type=int, default=8, help="Agent3每次最多使用多少历史商品构造伪查询。")

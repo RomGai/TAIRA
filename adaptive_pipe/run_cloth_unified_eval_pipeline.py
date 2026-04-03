@@ -1026,8 +1026,46 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_sentence = _query_sentence(query, routed.get("selected_category_paths", []) or [], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
 
-        filtered_item_ids = all_item_ids
-        print(f"[Agent3][categories] skip exact-match prefilter; candidate_count={len(filtered_item_ids)}")
+        query_recall_pool_mode = str(getattr(args, "agent3_query_recall_pool", "filtered")).strip().lower()
+        if query_recall_pool_mode == "full":
+            filtered_item_ids = list(all_item_ids)
+            print(f"[Agent3][categories] query_recall_pool=full candidate_count={len(filtered_item_ids)}")
+        else:
+            filtered_item_ids = _filter_item_ids_by_categories(
+                candidate_item_ids=all_item_ids,
+                meta_map=meta_map,
+                selected_categories=routed.get("selected_category_paths", []) or [],
+            )
+            print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
+
+            if not filtered_item_ids:
+                print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
+                _write_recall_failed_zero_output(
+                    output_path=existing_output,
+                    user_id=user_id,
+                    query=q_sentence,
+                    target_id=target_id,
+                )
+                results.append(
+                    {
+                        "user_id": user_id,
+                        "target_id": target_id,
+                        "hit": 0,
+                        "used_k": 0,
+                        "kw_debug": {
+                            "keywords": [],
+                            "keyword_matched_count": 0,
+                            "keyword_stage": "category_prefilter_empty",
+                            "keyword_pool_size": 0,
+                            "embedding_pool_size": 0,
+                            "merged_pool_size": 0,
+                            "fixed_recall_topk": int(args.fixed_recall_topk),
+                            "prefilter_candidate_size": 0,
+                        },
+                    }
+                )
+                _print_dynamic_output_metrics(args.output_dir)
+                continue
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
@@ -1295,6 +1333,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
     parser.add_argument("--enable-agent3-adaptive-weighting", action="store_true", help="开启Agent3基于历史伪查询的text/vl自适应权重迭代。")
+<<<<<<< codex/improve-agent-reasoning-for-ranking-adjustment-uet8m5
+    parser.add_argument(
+        "--agent3-query-recall-pool",
+        choices=["filtered", "full"],
+        default="filtered",
+        help="控制真实query召回候选池：filtered=categories过滤后；full=全库。",
+    )
+=======
+>>>>>>> master
     parser.add_argument("--agent3-adaptive-min-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量下限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量上限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-pseudo-queries", type=int, default=8, help="Agent3每次最多使用多少历史商品构造伪查询。")
