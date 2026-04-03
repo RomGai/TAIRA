@@ -554,14 +554,29 @@ def _adaptive_embedding_fusion(
         trend_weights = [(idx + 1) for idx in range(len(window))]
         trend_sum = float(sum(trend_weights))
         trend_text = sum(w * float(row.get("weights", {}).get("text", 0.5)) for w, row in zip(trend_weights, window)) / trend_sum
+        text_vote = 0.0
+        vl_vote = 0.0
         signs = []
-        for row in window:
+        for idx, row in enumerate(window, start=1):
             t_rank = int(row.get("text_rank", 10**9))
             v_rank = int(row.get("vl_rank", 10**9))
-            signs.append(1 if t_rank < v_rank else (-1 if v_rank < t_rank else 0))
+            confidence = float(row.get("weights", {}).get("text", 0.5))
+            if t_rank < v_rank:
+                signs.append(1)
+                text_vote += idx * max(0.2, confidence)
+            elif v_rank < t_rank:
+                signs.append(-1)
+                vl_vote += idx * max(0.2, 1.0 - confidence)
+            else:
+                signs.append(0)
         switch_count = sum(1 for i in range(1, len(signs)) if signs[i] != 0 and signs[i - 1] != 0 and signs[i] != signs[i - 1])
         stable = switch_count <= 1
-        if stable and trend_text >= 0.6:
+        vote_total = max(1e-6, text_vote + vl_vote)
+        vote_margin = abs(text_vote - vl_vote) / vote_total
+        if stable and vote_margin >= 0.15:
+            dominant_share = min(0.95, 0.8 + 0.15 * vote_margin)
+            final_text = dominant_share if text_vote >= vl_vote else (1.0 - dominant_share)
+        elif stable and trend_text >= 0.6:
             final_text = max(0.8, trend_text)
         elif stable and trend_text <= 0.4:
             final_text = min(0.2, trend_text)
@@ -574,7 +589,11 @@ def _adaptive_embedding_fusion(
             "vl_weight": round(final_vl, 4),
             "recall_size": int(cur_total_k),
             "mode": "history_agent_update",
-            "reasoning": f"trend_text={round(trend_text, 3)}, switches={switch_count}, stable={stable}",
+            "reasoning": (
+                f"trend_text={round(trend_text, 3)}, text_vote={round(text_vote, 3)}, "
+                f"vl_vote={round(vl_vote, 3)}, margin={round(vote_margin, 3)}, "
+                f"switches={switch_count}, stable={stable}"
+            ),
         }
 
     text_weight = 0.5
