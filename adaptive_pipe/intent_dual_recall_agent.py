@@ -837,6 +837,30 @@ class RoutingRecallAgent:
         item_scope_ids: Optional[set[str]] = None,
         max_total_recall: int = 500,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        def _safe_rank(rank: int) -> int:
+            return int(rank if rank < 10**9 else 5000)
+
+        def _rank_strength(rank: int) -> float:
+            safe = _safe_rank(rank)
+            return 1.0 / math.log2(safe + 2.0)
+
+        def _estimate_total_recall(trace: List[Dict[str, Any]], hard_cap: int) -> int:
+            if not trace:
+                return int(self._clamp(hard_cap, 50, 500))
+            required: List[float] = []
+            for row in trace:
+                t_rank = _safe_rank(int(row.get("text_rank", 5000)))
+                v_rank = _safe_rank(int(row.get("vl_rank", 5000)))
+                t_w = float(row.get("weights", {}).get("text", 0.5))
+                v_w = float(row.get("weights", {}).get("vl", 0.5))
+                midpoint = (t_rank + v_rank) / 2.0
+                dominance = abs(t_w - v_w)
+                weighted_floor = t_rank * t_w + v_rank * v_w
+                required.append(midpoint * (1.1 + 0.5 * dominance) + 0.3 * weighted_floor)
+            required.sort()
+            pivot = required[int(0.7 * (len(required) - 1))]
+            return int(self._clamp(round(pivot), 50, min(500, hard_cap)))
+
         memory: List[Dict[str, Any]] = []
         text_weight = 0.5
         vl_weight = 0.5
@@ -895,20 +919,14 @@ class RoutingRecallAgent:
             )
             text_rank = self._rank_of_item(text_ranked, target_item_id)
             vl_rank = self._rank_of_item(vl_ranked, target_item_id)
-            rank_gap = abs(text_rank - vl_rank)
-            delta = self._clamp(rank_gap / 200.0, 0.02, 0.12)
-            if text_rank < vl_rank:
-                text_weight = self._clamp(text_weight + delta, 0.1, 0.9)
-            elif vl_rank < text_rank:
-                text_weight = self._clamp(text_weight - delta, 0.1, 0.9)
+            text_strength = _rank_strength(text_rank)
+            vl_strength = _rank_strength(vl_rank)
+            strength_sum = max(1e-8, text_strength + vl_strength)
+            target_text_weight = text_strength / strength_sum
+            confidence = min(1.0, abs(math.log((_safe_rank(vl_rank) + 1) / (_safe_rank(text_rank) + 1))) / 1.6)
+            blend = 0.35 + 0.55 * confidence
+            text_weight = self._clamp((1.0 - blend) * text_weight + blend * target_text_weight, 0.05, 0.95)
             vl_weight = 1.0 - text_weight
-
-            finite_ranks = [r for r in [text_rank, vl_rank] if r < 10**9]
-            if finite_ranks:
-                min_rank = min(finite_ranks)
-                max_rank = max(finite_ranks)
-                estimated_k = self._clamp((min_rank + max_rank) * 2, 50, 500)
-                total_recall = int(estimated_k)
 
             memory.append(
                 {
@@ -918,13 +936,14 @@ class RoutingRecallAgent:
                     "text_rank": text_rank,
                     "vl_rank": vl_rank,
                     "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
-                    "estimated_total_recall": int(total_recall),
                     "summary": (
-                        "text_recall_better" if text_rank < vl_rank else
-                        ("vl_recall_better" if vl_rank < text_rank else "balanced")
+                        f"strength_ratio={round(text_strength / max(vl_strength, 1e-8), 3)}, "
+                        f"confidence={round(confidence, 3)}"
                     ),
                 }
             )
+            total_recall = _estimate_total_recall(memory, int(max_total_recall))
+            memory[-1]["estimated_total_recall"] = int(total_recall)
 
         query_text_emb = self.query_embedding_model.encode(query)
         vl_model = self.vl_query_embedding_model or self.query_embedding_model
