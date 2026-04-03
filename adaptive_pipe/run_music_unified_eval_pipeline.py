@@ -21,6 +21,17 @@ except Exception:  # pragma: no cover
     torch = None
 
 try:
+    from adaptive_pipe.dynamic_reasoning_ranking_agent import run_module3
+    from adaptive_pipe.image_prefetch import prefetch_item_images
+    from adaptive_pipe.item_profiler_agents import (
+        GlobalItemDB,
+        HistoryItemProfileInput,
+        ItemProfileInput,
+        Qwen3VLExtractor,
+        UserHistoryLogDB,
+    )
+    from adaptive_pipe.intent_dual_recall_agent import Qwen3RouterLLM
+except ModuleNotFoundError:
     from dynamic_reasoning_ranking_agent import run_module3
     from image_prefetch import prefetch_item_images
     from item_profiler_agents import (
@@ -31,19 +42,6 @@ try:
         UserHistoryLogDB,
     )
     from intent_dual_recall_agent import Qwen3RouterLLM
-    from qwen3_vl_embedding import Qwen3VLEmbedder
-except ModuleNotFoundError:
-    from new_pipe.dynamic_reasoning_ranking_agent import run_module3
-    from new_pipe.image_prefetch import prefetch_item_images
-    from new_pipe.item_profiler_agents import (
-        GlobalItemDB,
-        HistoryItemProfileInput,
-        ItemProfileInput,
-        Qwen3VLExtractor,
-        UserHistoryLogDB,
-    )
-    from new_pipe.intent_dual_recall_agent import Qwen3RouterLLM
-    from new_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
 
 EN_STOPWORDS = {
     "a", "an", "the", "and", "or", "to", "for", "with", "of", "in", "on", "at", "from", "by",
@@ -326,7 +324,7 @@ def _build_item_embedding_cache(
 
 
 def _build_qwen3vl_item_embedding_cache(
-    qwen3vl_model: Qwen3VLEmbedder,
+    qwen3vl_model: Any,
     all_item_ids: List[str],
     meta_map: Dict[str, Dict[str, Any]],
     emb_cache_path: Path,
@@ -766,6 +764,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     qwen3vl_model = None
     qwen3vl_item_emb_norm: np.ndarray | None = None
     if args.enable_agent3_qwen3vl_embedding:
+        try:
+            from adaptive_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
+        except ModuleNotFoundError:
+            from qwen3_vl_embedding import Qwen3VLEmbedder
         print(f"[Init] load multimodal embedding model: {args.agent3_qwen3vl_model}")
         image_cache_dir = cache_dir / "agent3_qwen3vl_images"
         image_url_to_local = prefetch_item_images(
