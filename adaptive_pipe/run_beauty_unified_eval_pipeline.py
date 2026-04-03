@@ -19,6 +19,17 @@ except Exception:  # pragma: no cover
     torch = None
 
 try:
+    from adaptive_pipe.dynamic_reasoning_ranking_agent import run_module3
+    from adaptive_pipe.image_prefetch import prefetch_item_images
+    from adaptive_pipe.item_profiler_agents import (
+        GlobalItemDB,
+        HistoryItemProfileInput,
+        ItemProfileInput,
+        Qwen3VLExtractor,
+        UserHistoryLogDB,
+    )
+    from adaptive_pipe.intent_dual_recall_agent import Qwen3RouterLLM
+except ModuleNotFoundError:
     from dynamic_reasoning_ranking_agent import run_module3
     from image_prefetch import prefetch_item_images
     from item_profiler_agents import (
@@ -29,19 +40,6 @@ try:
         UserHistoryLogDB,
     )
     from intent_dual_recall_agent import Qwen3RouterLLM
-    from qwen3_vl_embedding import Qwen3VLEmbedder
-except ModuleNotFoundError:
-    from new_pipe.dynamic_reasoning_ranking_agent import run_module3
-    from new_pipe.image_prefetch import prefetch_item_images
-    from new_pipe.item_profiler_agents import (
-        GlobalItemDB,
-        HistoryItemProfileInput,
-        ItemProfileInput,
-        Qwen3VLExtractor,
-        UserHistoryLogDB,
-    )
-    from new_pipe.intent_dual_recall_agent import Qwen3RouterLLM
-    from new_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
 
 EN_STOPWORDS = {
     "a", "an", "the", "and", "or", "to", "for", "with", "of", "in", "on", "at", "from", "by",
@@ -246,7 +244,7 @@ def _build_item_embedding_cache(
 
 
 def _build_qwen3vl_item_embedding_cache(
-    qwen3vl_model: Qwen3VLEmbedder,
+    qwen3vl_model: Any,
     all_item_ids: List[str],
     meta_map: Dict[str, Dict[str, Any]],
     emb_cache_path: Path,
@@ -336,9 +334,11 @@ def _build_hybrid_recall_ids(
     title_lower_map: Dict[str, str],
     keywords: List[str],
     rank_indices: np.ndarray,
-    fixed_recall_topk: int,
+    keyword_recall_topk: int,
+    embedding_recall_topk: int,
 ) -> Tuple[List[str], int, Dict[str, Any]]:
-    recall_topk = max(1, int(fixed_recall_topk))
+    keyword_topk = max(0, int(keyword_recall_topk))
+    embedding_topk = max(0, int(embedding_recall_topk))
 
     matched_scored: List[Tuple[int, str, List[str]]] = []
     for iid in all_item_ids:
@@ -346,11 +346,12 @@ def _build_hybrid_recall_ids(
         if score > 0:
             matched_scored.append((score, iid, matched))
     matched_scored.sort(key=lambda x: (-x[0], x[1]))
-    matched_ids = [x[1] for x in matched_scored[:recall_topk]]
+    matched_ids = [x[1] for x in matched_scored[:keyword_topk]] if keyword_topk > 0 else []
 
     embedding_ids: List[str] = []
-    for idx in rank_indices[:recall_topk]:
-        embedding_ids.append(all_item_ids[int(idx)])
+    if embedding_topk > 0:
+        for idx in rank_indices[:embedding_topk]:
+            embedding_ids.append(all_item_ids[int(idx)])
 
     merged_ids: List[str] = []
     seen = set()
@@ -363,11 +364,12 @@ def _build_hybrid_recall_ids(
     debug = {
         "keywords": keywords,
         "keyword_matched_count": len(matched_scored),
-        "keyword_stage": f"fixed_top{recall_topk}",
+        "keyword_stage": f"top{keyword_topk}",
         "keyword_pool_size": len(matched_ids),
         "embedding_pool_size": len(embedding_ids),
         "merged_pool_size": len(merged_ids),
-        "fixed_recall_topk": recall_topk,
+        "keyword_recall_topk": keyword_topk,
+        "embedding_recall_topk": embedding_topk,
     }
     return merged_ids, len(merged_ids), debug
 
@@ -382,6 +384,74 @@ def _merge_unique_ids(*id_lists: List[str]) -> List[str]:
             seen.add(iid)
             merged.append(iid)
     return merged
+
+
+def _rank_position_map(rank_indices: np.ndarray, item_ids: List[str]) -> Dict[str, int]:
+    pos: Dict[str, int] = {}
+    for rank, idx in enumerate(rank_indices, start=1):
+        item_id = item_ids[int(idx)]
+        if item_id not in pos:
+            pos[item_id] = rank
+    return pos
+
+
+def _adaptive_embedding_fusion(
+    history_ids: List[str],
+    filtered_item_ids: List[str],
+    text_rank_indices: np.ndarray,
+    qwen3vl_rank_indices: np.ndarray | None,
+    max_total_recall: int = 500,
+    max_pseudo_queries: int = 8,
+) -> Tuple[List[str], Dict[str, Any]]:
+    text_weight = 0.5
+    vl_weight = 0.5
+    total_k = int(max(50, min(500, max_total_recall)))
+    memory: List[Dict[str, Any]] = []
+
+    if qwen3vl_rank_indices is None:
+        top_ids = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:total_k]]
+        return top_ids, {"enabled": False, "reason": "qwen3vl_unavailable", "memory": memory}
+
+    text_rank_map = _rank_position_map(text_rank_indices, filtered_item_ids)
+    vl_rank_map = _rank_position_map(qwen3vl_rank_indices, filtered_item_ids)
+    pseudo_targets = [iid for iid in history_ids if iid in text_rank_map][: max(1, int(max_pseudo_queries))]
+    for step, iid in enumerate(pseudo_targets, start=1):
+        text_rank = text_rank_map.get(iid, 10**9)
+        vl_rank = vl_rank_map.get(iid, 10**9)
+        gap = abs(text_rank - vl_rank)
+        delta = max(0.02, min(0.12, gap / 200.0))
+        if text_rank < vl_rank:
+            text_weight = max(0.1, min(0.9, text_weight + delta))
+        elif vl_rank < text_rank:
+            text_weight = max(0.1, min(0.9, text_weight - delta))
+        vl_weight = 1.0 - text_weight
+        finite_ranks = [r for r in [text_rank, vl_rank] if r < 10**9]
+        if finite_ranks:
+            total_k = int(max(50, min(500, (min(finite_ranks) + max(finite_ranks)) * 2)))
+        memory.append(
+            {
+                "step": step,
+                "target_item_id": iid,
+                "text_rank": int(text_rank),
+                "vl_rank": int(vl_rank),
+                "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
+                "estimated_total_recall": int(total_k),
+            }
+        )
+
+    text_k = max(1, int(round(total_k * text_weight)))
+    vl_k = max(1, int(round(total_k * vl_weight)))
+    text_ids = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:text_k]]
+    vl_ids = [filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:vl_k]]
+    fused = _merge_unique_ids(text_ids, vl_ids)[: min(500, total_k)]
+    return fused, {
+        "enabled": True,
+        "text_weight": round(text_weight, 4),
+        "vl_weight": round(vl_weight, 4),
+        "total_recall": int(min(500, total_k)),
+        "pseudo_query_count": len(pseudo_targets),
+        "memory": memory,
+    }
 
 
 def _filter_item_ids_by_categories(
@@ -610,6 +680,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     qwen3vl_model = None
     qwen3vl_item_emb_norm: np.ndarray | None = None
     if args.enable_agent3_qwen3vl_embedding:
+        try:
+            from adaptive_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
+        except ModuleNotFoundError:
+            from qwen3_vl_embedding import Qwen3VLEmbedder
         print(f"[Init] load multimodal embedding model: {args.agent3_qwen3vl_model}")
         image_cache_dir = cache_dir / "agent3_qwen3vl_images"
         image_url_to_local = prefetch_item_images(
@@ -711,13 +785,20 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         rank_indices = np.argsort(-sim_matrix)
 
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
+        hybrid_embedding_topk = (
+            0
+            if bool(getattr(args, "enable_agent3_adaptive_weighting", False))
+            else int(args.embedding_recall_topk if args.embedding_recall_topk > 0 else args.fixed_recall_topk)
+        )
         top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
             all_item_ids=filtered_item_ids,
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
-            fixed_recall_topk=args.fixed_recall_topk,
+            keyword_recall_topk=int(args.keyword_recall_topk if args.keyword_recall_topk > 0 else args.fixed_recall_topk),
+            embedding_recall_topk=hybrid_embedding_topk,
         )
+        qwen3vl_rank_indices = None
         if args.enable_agent3_qwen3vl_embedding and qwen3vl_model is not None and qwen3vl_item_emb_norm is not None:
             qwen3vl_query_input = {"text": q_sentence}
             query_image = str(row.get("query_image") or row.get("image") or row.get("image_url") or "").strip()
@@ -740,6 +821,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             kw_debug["merged_pool_size"] = len(top_ids)
         else:
             kw_debug["qwen3vl_enabled"] = False
+        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
+        if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
+            adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
+                history_ids=history_ids,
+                filtered_item_ids=filtered_item_ids,
+                text_rank_indices=rank_indices,
+                qwen3vl_rank_indices=qwen3vl_rank_indices,
+                max_total_recall=int(getattr(args, "agent3_adaptive_max_total_recall", 500)),
+                max_pseudo_queries=int(getattr(args, "agent3_adaptive_max_pseudo_queries", 8)),
+            )
+            top_ids = _merge_unique_ids(top_ids, adaptive_ids)
+            used_k = len(top_ids)
+            kw_debug["adaptive_embedding_state"] = adaptive_state
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
             f"stage={kw_debug['keyword_stage']} prefilter_size={len(filtered_item_ids)}"
@@ -784,7 +878,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 print(f"[Agent1] {i}/{len(top_ids)}")
 
         history_rows: List[Dict[str, Any]] = []
-        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
         for i, iid in enumerate(history_ids, start=1):
             meta = meta_map.get(iid)
             if meta is None:
@@ -871,7 +964,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
-    parser.add_argument("--fixed-recall-topk", type=int, default=250, help="Agent3标题关键词召回和embedding召回各自采用的固定Top-K。")
+    parser.add_argument("--fixed-recall-topk", type=int, default=250, help="兼容旧参数：当未单独指定关键词/embedding召回Top-K时，作为默认值。")
+    parser.add_argument("--keyword-recall-topk", type=int, default=0, help="Agent3基于关键词匹配的召回Top-K；<=0时回退到--fixed-recall-topk。")
+    parser.add_argument("--embedding-recall-topk", type=int, default=0, help="Agent3纯text向量召回Top-K；<=0时回退到--fixed-recall-topk。若开启adaptive则该路自动置0。")
     parser.add_argument("--enable-agent3-qwen3vl-embedding", action="store_true", help="开启后，Agent3新增一路Qwen3-VL多模态embedding召回（文本+图片）。默认关闭。")
     parser.add_argument("--agent3-qwen3vl-topk", type=int, default=25, help="Agent3新增Qwen3-VL多模态embedding召回Top-K。")
     parser.add_argument("--agent3-qwen3vl-model", default="Qwen/Qwen3-VL-Embedding-2B", help="Agent3多模态embedding模型名称。")
@@ -879,6 +974,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent3-qwen3vl-save-every", type=int, default=1000, help="Qwen3-VL embedding每累计多少条落盘一次part文件，最后再合并。")
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
+    parser.add_argument("--enable-agent3-adaptive-weighting", action="store_true", help="开启Agent3基于历史伪查询的text/vl自适应权重迭代。")
+    parser.add_argument("--agent3-adaptive-max-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量上限（<=500）。")
+    parser.add_argument("--agent3-adaptive-max-pseudo-queries", type=int, default=8, help="Agent3每次最多使用多少历史商品构造伪查询。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
