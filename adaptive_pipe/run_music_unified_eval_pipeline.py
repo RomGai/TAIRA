@@ -593,9 +593,13 @@ def _adaptive_embedding_fusion(
     filtered_item_ids: List[str],
     text_rank_indices: np.ndarray,
     qwen3vl_rank_indices: np.ndarray | None,
+    min_total_recall: int = 500,
     max_total_recall: int = 500,
     max_pseudo_queries: int = 8,
 ) -> Tuple[List[str], Dict[str, Any]]:
+    min_recall = int(max(1, min(500, min_total_recall)))
+    max_recall = int(max(min_recall, min(500, max_total_recall)))
+
     def _safe_rank(rank: int) -> int:
         return int(rank if rank < 10**9 else 5000)
 
@@ -605,7 +609,7 @@ def _adaptive_embedding_fusion(
 
     def _estimate_total_k(history: List[Dict[str, Any]], hard_cap: int) -> int:
         if not history:
-            return int(max(50, min(500, hard_cap)))
+            return int(max(min_recall, min(500, hard_cap)))
         required: List[float] = []
         for row in history:
             t_rank = _safe_rank(int(row.get("text_rank", 5000)))
@@ -618,7 +622,7 @@ def _adaptive_embedding_fusion(
             required.append(low_rank * (1.15 + 0.35 * dominance) + 0.15 * high_rank)
         required.sort()
         pivot = required[int(0.75 * (len(required) - 1))]
-        return int(max(50, min(500, min(hard_cap, round(pivot)))))
+        return int(max(min_recall, min(500, min(hard_cap, round(pivot)))))
 
     def _agent_finalize_params(
         history: List[Dict[str, Any]],
@@ -681,7 +685,7 @@ def _adaptive_embedding_fusion(
     text_weight = 0.5
     vl_weight = 0.5
     history_target_text = 0.5
-    total_k = int(max(50, min(500, max_total_recall)))
+    total_k = int(max(min_recall, min(500, max_recall)))
     memory: List[Dict[str, Any]] = []
 
     if qwen3vl_rank_indices is None:
@@ -735,7 +739,7 @@ def _adaptive_embedding_fusion(
                 ),
             }
         )
-        total_k = _estimate_total_k(memory, int(max_total_recall))
+        total_k = _estimate_total_k(memory, int(max_recall))
         memory[-1]["estimated_total_recall"] = int(total_k)
 
     agent_final_params = _agent_finalize_params(memory, text_weight, vl_weight, total_k)
@@ -1171,6 +1175,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 filtered_item_ids=filtered_item_ids,
                 text_rank_indices=rank_indices,
                 qwen3vl_rank_indices=qwen3vl_rank_indices,
+                min_total_recall=int(getattr(args, "agent3_adaptive_min_total_recall", 500)),
                 max_total_recall=int(getattr(args, "agent3_adaptive_max_total_recall", 500)),
                 max_pseudo_queries=int(getattr(args, "agent3_adaptive_max_pseudo_queries", 8)),
             )
@@ -1351,6 +1356,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
     parser.add_argument("--enable-agent3-adaptive-weighting", action="store_true", help="开启Agent3基于历史伪查询的text/vl自适应权重迭代。")
+    parser.add_argument("--agent3-adaptive-min-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量下限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量上限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-pseudo-queries", type=int, default=8, help="Agent3每次最多使用多少历史商品构造伪查询。")
     parser.add_argument(
