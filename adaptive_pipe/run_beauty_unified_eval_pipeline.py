@@ -509,12 +509,116 @@ def _adaptive_embedding_fusion(
     filtered_item_ids: List[str],
     text_rank_indices: np.ndarray,
     qwen3vl_rank_indices: np.ndarray | None,
+    meta_map: Dict[str, Dict[str, Any]],
+    min_total_recall: int = 500,
     max_total_recall: int = 500,
     max_pseudo_queries: int = 8,
 ) -> Tuple[List[str], Dict[str, Any]]:
+    min_recall = int(max(1, min(500, min_total_recall)))
+    max_recall = int(max(min_recall, min(500, max_total_recall)))
+
+    def _safe_rank(rank: int) -> int:
+        return int(rank if rank < 10**9 else 5000)
+
+    def _rank_strength(rank: int) -> float:
+        safe = _safe_rank(rank)
+        return 1.0 / math.log2(safe + 2.0)
+
+    def _estimate_total_k(history: List[Dict[str, Any]], hard_cap: int) -> int:
+        if not history:
+            return int(max(min_recall, min(500, hard_cap)))
+        required: List[float] = []
+        for row in history:
+            if not bool(row.get("rank_available", True)):
+                continue
+            t_raw = row.get("text_rank")
+            v_raw = row.get("vl_rank")
+            if t_raw is None and v_raw is None:
+                continue
+            t_rank = _safe_rank(int(t_raw)) if t_raw is not None else 5000
+            v_rank = _safe_rank(int(v_raw)) if v_raw is not None else 5000
+            t_w = float(row.get("weights", {}).get("text", 0.5))
+            v_w = float(row.get("weights", {}).get("vl", 0.5))
+            low_rank = min(t_rank, v_rank)
+            high_rank = max(t_rank, v_rank)
+            dominance = abs(t_w - v_w)
+            required.append(low_rank * (1.15 + 0.35 * dominance) + 0.15 * high_rank)
+        if not required:
+            return int(max(min_recall, min(500, hard_cap)))
+        required.sort()
+        pivot = required[int(0.75 * (len(required) - 1))]
+        return int(max(min_recall, min(500, min(hard_cap, round(pivot)))))
+
+    def _agent_finalize_params(
+        history: List[Dict[str, Any]],
+        cur_text_weight: float,
+        cur_vl_weight: float,
+        cur_total_k: int,
+    ) -> Dict[str, Any]:
+        if not history:
+            return {
+                "text_weight": round(cur_text_weight, 4),
+                "vl_weight": round(cur_vl_weight, 4),
+                "recall_size": int(cur_total_k),
+                "mode": "fallback",
+                "reasoning": "no_history",
+            }
+        window = [row for row in history[-min(6, len(history)) :] if bool(row.get("rank_available", True))]
+        if not window:
+            return {
+                "text_weight": round(cur_text_weight, 4),
+                "vl_weight": round(cur_vl_weight, 4),
+                "recall_size": int(cur_total_k),
+                "mode": "fallback",
+                "reasoning": "no_ranked_history_in_pool",
+            }
+        trend_text = sum(float(row.get("weights", {}).get("text", 0.5)) for row in window) / max(1, len(window))
+        text_vote = 0.0
+        vl_vote = 0.0
+        signs = []
+        for row in window:
+            t_rank = int(row.get("text_rank", 10**9))
+            v_rank = int(row.get("vl_rank", 10**9))
+            confidence = float(row.get("weights", {}).get("text", 0.5))
+            if t_rank < v_rank:
+                signs.append(1)
+                text_vote += max(0.2, confidence)
+            elif v_rank < t_rank:
+                signs.append(-1)
+                vl_vote += max(0.2, 1.0 - confidence)
+            else:
+                signs.append(0)
+        switch_count = sum(1 for i in range(1, len(signs)) if signs[i] != 0 and signs[i - 1] != 0 and signs[i] != signs[i - 1])
+        stable = switch_count <= 1
+        vote_total = max(1e-6, text_vote + vl_vote)
+        vote_margin = abs(text_vote - vl_vote) / vote_total
+        if stable and vote_margin >= 0.15:
+            dominant_share = min(0.95, 0.8 + 0.15 * vote_margin)
+            final_text = dominant_share if text_vote >= vl_vote else (1.0 - dominant_share)
+        elif stable and trend_text >= 0.6:
+            final_text = max(0.8, trend_text)
+        elif stable and trend_text <= 0.4:
+            final_text = min(0.2, trend_text)
+        else:
+            final_text = trend_text
+        final_text = float(max(0.05, min(0.95, final_text)))
+        final_vl = 1.0 - final_text
+        return {
+            "text_weight": round(final_text, 4),
+            "vl_weight": round(final_vl, 4),
+            "recall_size": int(cur_total_k),
+            "mode": "history_agent_update",
+            "reasoning": (
+                f"trend_text={round(trend_text, 3)}, text_vote={round(text_vote, 3)}, "
+                f"vl_vote={round(vl_vote, 3)}, margin={round(vote_margin, 3)}, "
+                f"switches={switch_count}, stable={stable}"
+            ),
+        }
+
     text_weight = 0.5
     vl_weight = 0.5
-    total_k = int(max(50, min(500, max_total_recall)))
+    history_target_text = 0.5
+    total_k = int(max(min_recall, min(500, max_recall)))
     memory: List[Dict[str, Any]] = []
 
     if qwen3vl_rank_indices is None:
@@ -523,46 +627,86 @@ def _adaptive_embedding_fusion(
 
     text_rank_map = _rank_position_map(text_rank_indices, filtered_item_ids)
     vl_rank_map = _rank_position_map(qwen3vl_rank_indices, filtered_item_ids)
-    text_top5 = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:5]]
-    vl_top5 = [filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:5]]
-    pseudo_targets = [iid for iid in history_ids if iid in text_rank_map][: max(1, int(max_pseudo_queries))]
+    history_candidates: List[str] = []
+    seen_history: set[str] = set()
+    for raw_iid in history_ids:
+        iid = str(raw_iid).strip()
+        if not iid or iid in seen_history:
+            continue
+        seen_history.add(iid)
+        if iid in meta_map:
+            history_candidates.append(iid)
+    pseudo_targets = history_candidates[: max(1, int(max_pseudo_queries))]
     for step, iid in enumerate(pseudo_targets, start=1):
         prev_text_weight = text_weight
         prev_vl_weight = vl_weight
-        text_rank = text_rank_map.get(iid, 10**9)
-        vl_rank = vl_rank_map.get(iid, 10**9)
-        gap = abs(text_rank - vl_rank)
-        delta = max(0.02, min(0.12, gap / 200.0))
+        text_rank_raw = text_rank_map.get(iid)
+        vl_rank_raw = vl_rank_map.get(iid)
+        rank_available = text_rank_raw is not None or vl_rank_raw is not None
+        if not rank_available:
+            memory.append(
+                {
+                    "step": step,
+                    "target_item_id": iid,
+                    "text_rank": None,
+                    "vl_rank": None,
+                    "rank_available": False,
+                    "weights_before": {"text": round(prev_text_weight, 4), "vl": round(prev_vl_weight, 4)},
+                    "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
+                    "reasoning": "history_item_not_in_current_recall_pool",
+                }
+            )
+            continue
+        text_rank = int(text_rank_raw) if text_rank_raw is not None else 10**9
+        vl_rank = int(vl_rank_raw) if vl_rank_raw is not None else 10**9
+        text_strength = _rank_strength(text_rank)
+        vl_strength = _rank_strength(vl_rank)
+        strength_sum = max(1e-8, text_strength + vl_strength)
+        strength_target_text = text_strength / strength_sum
+        low_rank = min(_safe_rank(text_rank), _safe_rank(vl_rank))
+        gap = abs(_safe_rank(text_rank) - _safe_rank(vl_rank))
+        confidence = min(1.0, abs(math.log((_safe_rank(vl_rank) + 1) / (_safe_rank(text_rank) + 1))) / 1.6)
+        cover_share = min(0.95, max(0.5, low_rank / max(1.0, float(total_k))))
+        gap_bonus = min(0.15, math.log1p(gap) / 40.0)
+        dominant_share = min(0.95, max(0.8, cover_share + gap_bonus))
         if text_rank < vl_rank:
-            text_weight = max(0.1, min(0.9, text_weight + delta))
+            step_target_text = dominant_share
         elif vl_rank < text_rank:
-            text_weight = max(0.1, min(0.9, text_weight - delta))
+            step_target_text = 1.0 - dominant_share
+        else:
+            step_target_text = 0.5
+        step_target_text = 0.45 * strength_target_text + 0.55 * step_target_text
+        history_target_text = 0.75 * history_target_text + 0.25 * step_target_text
+        max_step_change = 0.05 + 0.07 * confidence
+        step_delta = max(-max_step_change, min(max_step_change, history_target_text - text_weight))
+        text_weight = max(0.05, min(0.95, text_weight + step_delta))
         vl_weight = 1.0 - text_weight
-        finite_ranks = [r for r in [text_rank, vl_rank] if r < 10**9]
-        if finite_ranks:
-            total_k = int(max(50, min(500, (min(finite_ranks) + max(finite_ranks)) * 2)))
         memory.append(
             {
                 "step": step,
                 "target_item_id": iid,
                 "text_rank": int(text_rank),
                 "vl_rank": int(vl_rank),
-                "path_top5": {"text": text_top5, "vl": vl_top5},
+                "rank_available": True,
                 "weights_before": {"text": round(prev_text_weight, 4), "vl": round(prev_vl_weight, 4)},
                 "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
-                "estimated_total_recall": int(total_k),
                 "reasoning": (
-                    "text path ranks target higher; increase text weight"
-                    if text_rank < vl_rank
-                    else (
-                        "vl path ranks target higher; increase vl weight"
-                        if vl_rank < text_rank
-                        else "text/vl tie; keep balanced update"
-                    )
+                    f"strength_target={round(strength_target_text, 3)}, "
+                    f"dominant_share={round(dominant_share, 3)}, "
+                    f"confidence={round(confidence, 3)}, "
+                    f"history_target={round(history_target_text, 3)}; "
+                    "use history-smoothed extreme allocation (>=8:2 when modality differs)"
                 ),
             }
         )
+        total_k = _estimate_total_k(memory, int(max_recall))
+        memory[-1]["estimated_total_recall"] = int(total_k)
 
+    agent_final_params = _agent_finalize_params(memory, text_weight, vl_weight, total_k)
+    text_weight = float(agent_final_params["text_weight"])
+    vl_weight = float(agent_final_params["vl_weight"])
+    final_modal_weights = {"text": round(text_weight, 4), "vl": round(vl_weight, 4)}
+    final_modal_ratio = f"{int(round(text_weight * 100))}:{int(round(vl_weight * 100))}"
     text_k = max(1, int(round(total_k * text_weight)))
     vl_k = max(1, int(round(total_k * vl_weight)))
     text_ids = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:text_k]]
@@ -572,7 +716,14 @@ def _adaptive_embedding_fusion(
         "enabled": True,
         "text_weight": round(text_weight, 4),
         "vl_weight": round(vl_weight, 4),
+        "final_modal_weights": final_modal_weights,
+        "final_modal_ratio": final_modal_ratio,
         "total_recall": int(min(500, total_k)),
+        "agent_final_params": agent_final_params,
+        "history_item_count": len(history_candidates),
+        "history_items_in_recall_pool": int(
+            sum(1 for iid in pseudo_targets if iid in text_rank_map or iid in vl_rank_map)
+        ),
         "pseudo_query_count": len(pseudo_targets),
         "memory": memory,
     }
@@ -889,41 +1040,46 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
 
-        filtered_item_ids = _filter_item_ids_by_categories(
-            candidate_item_ids=all_item_ids,
-            meta_map=meta_map,
-            selected_categories=routed.get("selected_category_paths", []) or [],
-        )
-        print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
+        query_recall_pool_mode = str(getattr(args, "agent3_query_recall_pool", "filtered")).strip().lower()
+        if query_recall_pool_mode == "full":
+            filtered_item_ids = list(all_item_ids)
+            print(f"[Agent3][categories] query_recall_pool=full candidate_count={len(filtered_item_ids)}")
+        else:
+            filtered_item_ids = _filter_item_ids_by_categories(
+                candidate_item_ids=all_item_ids,
+                meta_map=meta_map,
+                selected_categories=routed.get("selected_category_paths", []) or [],
+            )
+            print(f"[Agent3][categories] exact_match_count={len(filtered_item_ids)}")
 
-        if not filtered_item_ids:
-            print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
-            _write_recall_failed_zero_output(
-                output_path=existing_output,
-                user_id=user_id,
-                query=q_sentence,
-                target_id=target_id,
-            )
-            results.append(
-                {
-                    "user_id": user_id,
-                    "target_id": target_id,
-                    "hit": 0,
-                    "used_k": 0,
-                    "kw_debug": {
-                        "keywords": [],
-                        "keyword_matched_count": 0,
-                        "keyword_stage": "category_prefilter_empty",
-                        "keyword_pool_size": 0,
-                        "embedding_pool_size": 0,
-                        "merged_pool_size": 0,
-                        "fixed_recall_topk": int(args.fixed_recall_topk),
-                        "prefilter_candidate_size": 0,
-                    },
-                }
-            )
-            _print_dynamic_output_metrics(args.output_dir)
-            continue
+            if not filtered_item_ids:
+                print("[Agent3] category exact-match prefilter found 0 items. recall failed.")
+                _write_recall_failed_zero_output(
+                    output_path=existing_output,
+                    user_id=user_id,
+                    query=q_sentence,
+                    target_id=target_id,
+                )
+                results.append(
+                    {
+                        "user_id": user_id,
+                        "target_id": target_id,
+                        "hit": 0,
+                        "used_k": 0,
+                        "kw_debug": {
+                            "keywords": [],
+                            "keyword_matched_count": 0,
+                            "keyword_stage": "category_prefilter_empty",
+                            "keyword_pool_size": 0,
+                            "embedding_pool_size": 0,
+                            "merged_pool_size": 0,
+                            "fixed_recall_topk": int(args.fixed_recall_topk),
+                            "prefilter_candidate_size": 0,
+                        },
+                    }
+                )
+                _print_dynamic_output_metrics(args.output_dir)
+                continue
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
@@ -932,6 +1088,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
         sim_matrix = np.matmul(filtered_emb, q_emb_norm[0])
         rank_indices = np.argsort(-sim_matrix)
+        full_sim_matrix = np.matmul(item_emb_norm, q_emb_norm[0])
+        full_rank_indices = np.argsort(-full_sim_matrix)
 
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
         hybrid_embedding_topk = (
@@ -948,6 +1106,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             embedding_recall_topk=hybrid_embedding_topk,
         )
         qwen3vl_rank_indices = None
+        qwen3vl_rank_indices_all = None
         if args.enable_agent3_qwen3vl_embedding and qwen3vl_model is not None and qwen3vl_item_emb_norm is not None:
             qwen3vl_query_input = {"text": q_sentence}
             query_image = str(row.get("query_image") or row.get("image") or row.get("image_url") or "").strip()
@@ -968,6 +1127,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 q_filtered_emb = qwen3vl_item_emb_norm[np.array(qwen_filtered_idx)]
                 qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
                 qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
+                qwen_all_item_ids = [iid for iid in all_item_ids if iid in qwen3vl_item_id_to_index]
+                qwen_all_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_all_item_ids]
+                qwen_all_emb = qwen3vl_item_emb_norm[np.array(qwen_all_idx)]
+                qwen_all_sim = np.matmul(qwen_all_emb, qwen3vl_q_emb_norm)
+                qwen_sim_aligned = np.full(len(all_item_ids), -1e9, dtype=np.float32)
+                aligned_pos = np.array([item_id_to_index[iid] for iid in qwen_all_item_ids], dtype=np.int32)
+                qwen_sim_aligned[aligned_pos] = qwen_all_sim.astype(np.float32, copy=False)
+                qwen3vl_rank_indices_all = np.argsort(-qwen_sim_aligned)
                 mm_topk = max(1, int(args.agent3_qwen3vl_topk))
                 qwen3vl_ids = [qwen_filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
                 top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
@@ -979,13 +1146,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 kw_debug["merged_pool_size"] = len(top_ids)
         else:
             kw_debug["qwen3vl_enabled"] = False
-        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
+        history_ids = list(
+            dict.fromkeys(
+                x.strip() for x in str(row.get("remaining_interaction_string", "")).split("|") if x.strip()
+            )
+        )
         if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
             adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
                 history_ids=history_ids,
-                filtered_item_ids=filtered_item_ids,
-                text_rank_indices=rank_indices,
-                qwen3vl_rank_indices=qwen3vl_rank_indices,
+                filtered_item_ids=all_item_ids,
+                text_rank_indices=full_rank_indices,
+                qwen3vl_rank_indices=qwen3vl_rank_indices_all,
+                meta_map=meta_map,
+                min_total_recall=int(getattr(args, "agent3_adaptive_min_total_recall", 500)),
                 max_total_recall=int(getattr(args, "agent3_adaptive_max_total_recall", 500)),
                 max_pseudo_queries=int(getattr(args, "agent3_adaptive_max_pseudo_queries", 8)),
             )
@@ -994,12 +1167,17 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             kw_debug["adaptive_embedding_state"] = adaptive_state
         adaptive_state = kw_debug.get("adaptive_embedding_state", {}) if isinstance(kw_debug, dict) else {}
         if isinstance(adaptive_state, dict) and adaptive_state.get("enabled"):
+            agent_final_params = adaptive_state.get("agent_final_params", {})
             modal_params = {
-                "text_weight": float(adaptive_state.get("text_weight", 0.5)),
-                "vl_weight": float(adaptive_state.get("vl_weight", 0.5)),
-                "recall_size": int(adaptive_state.get("total_recall", len(top_ids))),
-                "source": "adaptive",
+                "text_weight": float(agent_final_params.get("text_weight", adaptive_state.get("text_weight", 0.5))),
+                "vl_weight": float(agent_final_params.get("vl_weight", adaptive_state.get("vl_weight", 0.5))),
+                "recall_size": int(agent_final_params.get("recall_size", adaptive_state.get("total_recall", len(top_ids)))),
+                "source": "agent_adaptive" if agent_final_params else "adaptive",
             }
+            if isinstance(agent_final_params, dict) and agent_final_params:
+                modal_params["agent_reasoning"] = str(agent_final_params.get("reasoning", ""))
+            modal_params["final_modal_ratio"] = str(adaptive_state.get("final_modal_ratio", ""))
+            modal_params["final_modal_weights"] = adaptive_state.get("final_modal_weights", {})
         else:
             text_pool = int(kw_debug.get("embedding_pool_size", 0))
             vl_pool = int(kw_debug.get("qwen3vl_pool_size", 0))
@@ -1164,6 +1342,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
     parser.add_argument("--enable-agent3-adaptive-weighting", action="store_true", help="开启Agent3基于历史伪查询的text/vl自适应权重迭代。")
+    parser.add_argument(
+        "--agent3-query-recall-pool",
+        choices=["filtered", "full"],
+        default="filtered",
+        help="控制真实query召回候选池：filtered=categories过滤后；full=全库。",
+    )
+    parser.add_argument("--agent3-adaptive-min-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量下限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量上限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-pseudo-queries", type=int, default=8, help="Agent3每次最多使用多少历史商品构造伪查询。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
