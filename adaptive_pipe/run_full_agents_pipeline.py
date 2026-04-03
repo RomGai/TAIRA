@@ -335,6 +335,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             intent_dual_recall_output=payload,
             model_name=args.text_model,
             top_n=args.top_n,
+            groundtruth_target_item_id=str(getattr(args, "groundtruth_target_item_id", "")),
             disable_must_avoid=bool(getattr(args, "positive_history_only", False)),
             disable_must_have=bool(getattr(args, "disable_must_have", False)),
             disable_prediction_bonus=bool(getattr(args, "disable_prediction_bonus", False)),
@@ -396,6 +397,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidate-items", type=int, default=200)
     parser.add_argument("--max-history-rows", type=int, default=200)
     parser.add_argument("--top-n", type=int, default=21)
+    parser.add_argument("--groundtruth-target-item-id", default="")
     parser.add_argument(
         "--disable-agent3-item-type-filter",
         action="store_true",
