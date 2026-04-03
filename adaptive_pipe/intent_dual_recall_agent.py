@@ -861,6 +861,47 @@ class RoutingRecallAgent:
             pivot = required[int(0.75 * (len(required) - 1))]
             return int(self._clamp(round(pivot), 50, min(500, hard_cap)))
 
+        def _agent_finalize_params(
+            trace: List[Dict[str, Any]],
+            cur_text_weight: float,
+            cur_vl_weight: float,
+            cur_total_recall: int,
+        ) -> Dict[str, Any]:
+            if not trace:
+                return {
+                    "text_weight": round(cur_text_weight, 4),
+                    "vl_weight": round(cur_vl_weight, 4),
+                    "recall_size": int(cur_total_recall),
+                    "mode": "fallback",
+                    "reasoning": "no_history",
+                }
+            window = trace[-min(6, len(trace)) :]
+            trend_weights = [(idx + 1) for idx in range(len(window))]
+            trend_sum = float(sum(trend_weights))
+            trend_text = sum(w * float(row.get("weights", {}).get("text", 0.5)) for w, row in zip(trend_weights, window)) / trend_sum
+            signs = []
+            for row in window:
+                t_rank = int(row.get("text_rank", 10**9))
+                v_rank = int(row.get("vl_rank", 10**9))
+                signs.append(1 if t_rank < v_rank else (-1 if v_rank < t_rank else 0))
+            switch_count = sum(1 for i in range(1, len(signs)) if signs[i] != 0 and signs[i - 1] != 0 and signs[i] != signs[i - 1])
+            stable = switch_count <= 1
+            if stable and trend_text >= 0.6:
+                final_text = max(0.8, trend_text)
+            elif stable and trend_text <= 0.4:
+                final_text = min(0.2, trend_text)
+            else:
+                final_text = trend_text
+            final_text = float(self._clamp(final_text, 0.05, 0.95))
+            final_vl = 1.0 - final_text
+            return {
+                "text_weight": round(final_text, 4),
+                "vl_weight": round(final_vl, 4),
+                "recall_size": int(cur_total_recall),
+                "mode": "history_agent_update",
+                "reasoning": f"trend_text={round(trend_text, 3)}, switches={switch_count}, stable={stable}",
+            }
+
         memory: List[Dict[str, Any]] = []
         text_weight = 0.5
         vl_weight = 0.5
@@ -962,6 +1003,9 @@ class RoutingRecallAgent:
             total_recall = _estimate_total_recall(memory, int(max_total_recall))
             memory[-1]["estimated_total_recall"] = int(total_recall)
 
+        agent_final_params = _agent_finalize_params(memory, text_weight, vl_weight, total_recall)
+        text_weight = float(agent_final_params["text_weight"])
+        vl_weight = float(agent_final_params["vl_weight"])
         query_text_emb = self.query_embedding_model.encode(query)
         vl_model = self.vl_query_embedding_model or self.query_embedding_model
         try:
@@ -1007,6 +1051,7 @@ class RoutingRecallAgent:
             "text_weight": round(text_weight, 4),
             "vl_weight": round(vl_weight, 4),
             "total_recall": int(min(500, total_recall)),
+            "agent_final_params": agent_final_params,
             "memory": memory,
             "pseudo_query_count": len(pseudo_queries),
         }
