@@ -257,12 +257,44 @@ def _build_qwen3vl_item_embedding_cache(
     emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
     parts_dir = emb_cache_path.parent / f"{emb_cache_path.stem}_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
-    for old_part in sorted(parts_dir.glob("part_*.npz")):
-        old_part.unlink()
     pending_ids: List[str] = []
     pending_emb_chunks: List[np.ndarray] = []
     saved_part_paths: List[Path] = []
     part_idx = 0
+    resume_offset = 0
+
+    existing_parts = sorted(parts_dir.glob("part_*.npz"))
+    if existing_parts:
+        print(f"[Agent3][Qwen3VL] found existing part files: {len(existing_parts)}")
+        resume_ok = True
+        for part_path in existing_parts:
+            m = re.search(r"part_(\d+)\.npz$", part_path.name)
+            if m:
+                part_idx = max(part_idx, int(m.group(1)))
+            part_npz = np.load(part_path, allow_pickle=True)
+            part_ids = [str(x) for x in part_npz["item_ids"].tolist()]
+            expected_ids = all_item_ids[resume_offset : resume_offset + len(part_ids)]
+            if part_ids != expected_ids:
+                print(
+                    f"[Agent3][Qwen3VL][resume] mismatch at {part_path.name}; "
+                    "clear old parts and rebuild from scratch."
+                )
+                resume_ok = False
+                break
+            saved_part_paths.append(part_path)
+            resume_offset += len(part_ids)
+
+        if not resume_ok:
+            for old_part in existing_parts:
+                old_part.unlink()
+            saved_part_paths = []
+            part_idx = 0
+            resume_offset = 0
+        elif resume_offset > 0:
+            print(
+                f"[Agent3][Qwen3VL][resume] skip processed rows={resume_offset}, "
+                f"continue from index={resume_offset}."
+            )
 
     def _flush_pending() -> None:
         nonlocal part_idx, pending_ids, pending_emb_chunks
@@ -276,8 +308,9 @@ def _build_qwen3vl_item_embedding_cache(
         print(f"[Agent3][Qwen3VL][part save] {part_path.name} rows={len(pending_ids)}")
         pending_ids = []
         pending_emb_chunks = []
+        _cleanup_torch_cache()
 
-    for start in range(0, total, chunk_size):
+    for start in range(resume_offset, total, chunk_size):
         end = min(total, start + chunk_size)
         chunk_item_ids = all_item_ids[start:end]
         chunk_inputs = [_build_qwen3vl_item_input(meta_map[iid], image_url_to_local=image_url_to_local) for iid in chunk_item_ids]
@@ -285,8 +318,12 @@ def _build_qwen3vl_item_embedding_cache(
         pending_emb_chunks.append(chunk_emb)
         pending_ids.extend(chunk_item_ids)
         print(f"[Agent3][Qwen3VL][embedding chunk] {end}/{total} (chunk={start}-{end})")
+        del chunk_inputs
+        del chunk_emb
         if len(pending_ids) >= max(1, int(save_every_items)):
             _flush_pending()
+        else:
+            _cleanup_torch_cache()
 
     _flush_pending()
     if not saved_part_paths:
@@ -970,7 +1007,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-agent3-qwen3vl-embedding", action="store_true", help="开启后，Agent3新增一路Qwen3-VL多模态embedding召回（文本+图片）。默认关闭。")
     parser.add_argument("--agent3-qwen3vl-topk", type=int, default=25, help="Agent3新增Qwen3-VL多模态embedding召回Top-K。")
     parser.add_argument("--agent3-qwen3vl-model", default="Qwen/Qwen3-VL-Embedding-2B", help="Agent3多模态embedding模型名称。")
-    parser.add_argument("--agent3-qwen3vl-chunk-size", type=int, default=256, help="Qwen3-VL多模态embedding建库分块大小。")
+    parser.add_argument("--agent3-qwen3vl-chunk-size", type=int, default=100, help="Qwen3-VL多模态embedding建库分块大小（默认100）。")
     parser.add_argument("--agent3-qwen3vl-save-every", type=int, default=1000, help="Qwen3-VL embedding每累计多少条落盘一次part文件，最后再合并。")
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
