@@ -337,9 +337,16 @@ def _build_qwen3vl_item_embedding_cache(
     _flush_pending()
     if not saved_part_paths:
         raise ValueError("Failed to build Qwen3-VL embedding cache: no parts saved.")
-    all_parts = [np.load(p, allow_pickle=True)["item_embeddings"].astype(np.float32, copy=False) for p in saved_part_paths]
+    all_part_ids: List[str] = []
+    all_parts: List[np.ndarray] = []
+    for p in saved_part_paths:
+        part_npz = np.load(p, allow_pickle=True)
+        part_ids = [str(x) for x in part_npz["item_ids"].tolist()]
+        part_emb = part_npz["item_embeddings"].astype(np.float32, copy=False)
+        all_part_ids.extend(part_ids)
+        all_parts.append(part_emb)
     final_emb = np.concatenate(all_parts, axis=0)
-    np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids), item_embeddings=final_emb)
+    np.savez_compressed(emb_cache_path, item_ids=np.array(all_part_ids), item_embeddings=final_emb)
     for p in saved_part_paths:
         p.unlink()
     if parts_dir.exists() and not any(parts_dir.iterdir()):
@@ -729,7 +736,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             q_npz = np.load(qwen3vl_emb_cache_path, allow_pickle=True)
             q_item_ids_cached = [str(x) for x in q_npz["item_ids"].tolist()]
             q_item_emb_matrix = q_npz["item_embeddings"].astype(np.float32, copy=False)
-        if q_item_emb_matrix is None or q_item_ids_cached != all_item_ids:
+        if (
+            q_item_emb_matrix is None
+            or q_item_ids_cached != all_item_ids
+            or int(q_item_emb_matrix.shape[0]) != len(q_item_ids_cached)
+        ):
             q_item_emb_matrix = _build_qwen3vl_item_embedding_cache(
                 qwen3vl_model=qwen3vl_model,
                 all_item_ids=all_item_ids,
