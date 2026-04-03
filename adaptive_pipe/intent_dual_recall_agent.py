@@ -264,6 +264,65 @@ class GlobalHistoryAccessor:
         return None
 
     @staticmethod
+    def _extract_text_embedding(profile: Dict[str, Any]) -> Optional[List[float]]:
+        if not isinstance(profile, dict):
+            return None
+        candidate_keys = [
+            "text_embedding",
+            "query_text_embedding",
+            "semantic_embedding",
+            "dense_embedding",
+            "embedding",
+        ]
+        for key in candidate_keys:
+            vec = profile.get(key)
+            if isinstance(vec, list) and vec:
+                try:
+                    return [float(x) for x in vec]
+                except (TypeError, ValueError):
+                    continue
+
+        emb_group = profile.get("embeddings", {})
+        if isinstance(emb_group, dict):
+            for key in ["text", "semantic", "dense", "item"]:
+                vec = emb_group.get(key)
+                if isinstance(vec, list) and vec:
+                    try:
+                        return [float(x) for x in vec]
+                    except (TypeError, ValueError):
+                        continue
+        return None
+
+    @staticmethod
+    def _extract_vl_embedding(profile: Dict[str, Any]) -> Optional[List[float]]:
+        if not isinstance(profile, dict):
+            return None
+        candidate_keys = [
+            "vl_embedding",
+            "visual_embedding",
+            "image_embedding",
+            "multimodal_embedding",
+        ]
+        for key in candidate_keys:
+            vec = profile.get(key)
+            if isinstance(vec, list) and vec:
+                try:
+                    return [float(x) for x in vec]
+                except (TypeError, ValueError):
+                    continue
+
+        emb_group = profile.get("embeddings", {})
+        if isinstance(emb_group, dict):
+            for key in ["vl", "visual", "image", "multimodal"]:
+                vec = emb_group.get(key)
+                if isinstance(vec, list) and vec:
+                    try:
+                        return [float(x) for x in vec]
+                    except (TypeError, ValueError):
+                        continue
+        return None
+
+    @staticmethod
     def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
         if not vec_a or not vec_b or len(vec_a) != len(vec_b):
             return -1.0
@@ -396,6 +455,56 @@ class GlobalHistoryAccessor:
             )
             if len(out) >= max_items:
                 break
+        return out
+
+    def fetch_all_global_items(self) -> List[Dict[str, Any]]:
+        rows = self.global_conn.execute(
+            "SELECT item_id, profile_json, updated_at FROM global_item_features"
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "item_id": str(row["item_id"]),
+                    "profile": json.loads(row["profile_json"]),
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return out
+
+    def recall_by_embedding(
+        self,
+        query_embedding: Sequence[float],
+        embedding_type: str = "text",
+        item_scope_ids: Optional[set[str]] = None,
+        top_k: int = 200,
+    ) -> List[Dict[str, Any]]:
+        all_items = self.fetch_all_global_items()
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for item in all_items:
+            item_id = str(item.get("item_id", "")).strip()
+            if not item_id:
+                continue
+            if item_scope_ids is not None and item_id not in item_scope_ids:
+                continue
+            profile = item.get("profile", {}) or {}
+            if embedding_type == "vl":
+                emb = self._extract_vl_embedding(profile)
+            else:
+                emb = self._extract_text_embedding(profile)
+            if not emb:
+                continue
+            sim = self._cosine_similarity(query_embedding, emb)
+            if sim <= -1.0:
+                continue
+            scored.append((sim, item))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        out: List[Dict[str, Any]] = []
+        for sim, item in scored[: max(1, int(top_k))]:
+            payload = dict(item)
+            payload["semantic_similarity"] = float(sim)
+            payload["embedding_type"] = embedding_type
+            out.append(payload)
         return out
 
     def recall_user_history(
@@ -671,10 +780,200 @@ class RoutingRecallAgent:
         llm: Qwen3RouterLLM,
         accessor: GlobalHistoryAccessor,
         query_embedding_model: Optional[Qwen3QueryEmbeddingModel] = None,
+        vl_query_embedding_model: Optional[Qwen3QueryEmbeddingModel] = None,
     ) -> None:
         self.llm = llm
         self.accessor = accessor
         self.query_embedding_model = query_embedding_model
+        self.vl_query_embedding_model = vl_query_embedding_model or query_embedding_model
+
+    @staticmethod
+    def _clamp(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, float(v)))
+
+    @staticmethod
+    def _rank_of_item(items: Sequence[Dict[str, Any]], target_item_id: str) -> int:
+        target = str(target_item_id or "").strip()
+        if not target:
+            return 10**9
+        for idx, row in enumerate(items, start=1):
+            if str(row.get("item_id", "")).strip() == target:
+                return idx
+        return 10**9
+
+    def _generate_pseudo_queries(
+        self,
+        query: str,
+        history_rows: Sequence[Dict[str, Any]],
+        max_pseudo_queries: int = 10,
+    ) -> List[Dict[str, str]]:
+        pseudo_queries: List[Dict[str, str]] = []
+        for row in history_rows:
+            item_id = str(row.get("item_id", "")).strip()
+            if not item_id:
+                continue
+            profile = row.get("profile", {}) if isinstance(row.get("profile", {}), dict) else {}
+            taxonomy = profile.get("taxonomy", {}) if isinstance(profile, dict) else {}
+            item_type = str(taxonomy.get("item_type", "")).strip()
+            category = " > ".join(
+                [str(x).strip() for x in taxonomy.get("category_path", []) if str(x).strip()]
+            )
+            text_tags = profile.get("text_tags", []) if isinstance(profile, dict) else []
+            text_hint = ""
+            if isinstance(text_tags, list) and text_tags:
+                text_hint = "，".join(str(x).strip() for x in text_tags[:3] if str(x).strip())
+            pseudo = query
+            if category or item_type or text_hint:
+                pseudo = f"{query}（参考历史偏好：{item_type} {category} {text_hint}）".strip()
+            pseudo_queries.append({"item_id": item_id, "pseudo_query": pseudo})
+            if len(pseudo_queries) >= max(1, int(max_pseudo_queries)):
+                break
+        return pseudo_queries
+
+    def _adaptive_weighted_embedding_recall(
+        self,
+        user_id: str,
+        query: str,
+        item_scope_ids: Optional[set[str]] = None,
+        max_total_recall: int = 500,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        memory: List[Dict[str, Any]] = []
+        text_weight = 0.5
+        vl_weight = 0.5
+        total_recall = min(500, max(50, int(max_total_recall)))
+
+        if not (query or "").strip() or self.query_embedding_model is None:
+            return [], {
+                "enabled": False,
+                "reason": "query_empty_or_text_embedding_model_missing",
+                "memory": memory,
+                "text_weight": text_weight,
+                "vl_weight": vl_weight,
+                "total_recall": total_recall,
+            }
+
+        history_rows = self.accessor.recall_user_history_all(user_id=user_id, max_rows=200)
+        positive_rows = [r for r in history_rows if str(r.get("behavior", "")).lower() == "positive"]
+        pseudo_inputs = positive_rows if positive_rows else history_rows
+        pseudo_queries = self._generate_pseudo_queries(query=query, history_rows=pseudo_inputs, max_pseudo_queries=8)
+
+        if not pseudo_queries:
+            return [], {
+                "enabled": False,
+                "reason": "no_history_for_pseudo_queries",
+                "memory": memory,
+                "text_weight": text_weight,
+                "vl_weight": vl_weight,
+                "total_recall": total_recall,
+            }
+
+        for step, pseudo in enumerate(pseudo_queries, start=1):
+            pq = str(pseudo.get("pseudo_query", "")).strip() or query
+            target_item_id = str(pseudo.get("item_id", "")).strip()
+            try:
+                text_q_emb = self.query_embedding_model.encode(pq)
+            except Exception:
+                continue
+
+            vl_model = self.vl_query_embedding_model or self.query_embedding_model
+            try:
+                vl_q_emb = vl_model.encode(pq)
+            except Exception:
+                vl_q_emb = text_q_emb
+
+            text_ranked = self.accessor.recall_by_embedding(
+                query_embedding=text_q_emb,
+                embedding_type="text",
+                item_scope_ids=item_scope_ids,
+                top_k=max(500, total_recall),
+            )
+            vl_ranked = self.accessor.recall_by_embedding(
+                query_embedding=vl_q_emb,
+                embedding_type="vl",
+                item_scope_ids=item_scope_ids,
+                top_k=max(500, total_recall),
+            )
+            text_rank = self._rank_of_item(text_ranked, target_item_id)
+            vl_rank = self._rank_of_item(vl_ranked, target_item_id)
+            rank_gap = abs(text_rank - vl_rank)
+            delta = self._clamp(rank_gap / 200.0, 0.02, 0.12)
+            if text_rank < vl_rank:
+                text_weight = self._clamp(text_weight + delta, 0.1, 0.9)
+            elif vl_rank < text_rank:
+                text_weight = self._clamp(text_weight - delta, 0.1, 0.9)
+            vl_weight = 1.0 - text_weight
+
+            finite_ranks = [r for r in [text_rank, vl_rank] if r < 10**9]
+            if finite_ranks:
+                min_rank = min(finite_ranks)
+                max_rank = max(finite_ranks)
+                estimated_k = self._clamp((min_rank + max_rank) * 2, 50, 500)
+                total_recall = int(estimated_k)
+
+            memory.append(
+                {
+                    "step": step,
+                    "target_item_id": target_item_id,
+                    "pseudo_query": pq,
+                    "text_rank": text_rank,
+                    "vl_rank": vl_rank,
+                    "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
+                    "estimated_total_recall": int(total_recall),
+                    "summary": (
+                        "text_recall_better" if text_rank < vl_rank else
+                        ("vl_recall_better" if vl_rank < text_rank else "balanced")
+                    ),
+                }
+            )
+
+        query_text_emb = self.query_embedding_model.encode(query)
+        vl_model = self.vl_query_embedding_model or self.query_embedding_model
+        try:
+            query_vl_emb = vl_model.encode(query)
+        except Exception:
+            query_vl_emb = query_text_emb
+
+        text_k = max(1, int(round(total_recall * text_weight)))
+        vl_k = max(1, int(round(total_recall * vl_weight)))
+        text_ranked = self.accessor.recall_by_embedding(
+            query_embedding=query_text_emb,
+            embedding_type="text",
+            item_scope_ids=item_scope_ids,
+            top_k=text_k,
+        )
+        vl_ranked = self.accessor.recall_by_embedding(
+            query_embedding=query_vl_emb,
+            embedding_type="vl",
+            item_scope_ids=item_scope_ids,
+            top_k=vl_k,
+        )
+
+        merged_scores: Dict[str, Dict[str, Any]] = {}
+        for idx, item in enumerate(text_ranked, start=1):
+            iid = str(item.get("item_id", "")).strip()
+            if not iid:
+                continue
+            weight_score = text_weight * (1.0 / float(idx))
+            merged_scores[iid] = {"item": item, "score": weight_score}
+        for idx, item in enumerate(vl_ranked, start=1):
+            iid = str(item.get("item_id", "")).strip()
+            if not iid:
+                continue
+            weight_score = vl_weight * (1.0 / float(idx))
+            if iid not in merged_scores:
+                merged_scores[iid] = {"item": item, "score": weight_score}
+            else:
+                merged_scores[iid]["score"] += weight_score
+
+        ranked_items = [v["item"] for v in sorted(merged_scores.values(), key=lambda x: x["score"], reverse=True)]
+        return ranked_items[: min(500, total_recall)], {
+            "enabled": True,
+            "text_weight": round(text_weight, 4),
+            "vl_weight": round(vl_weight, 4),
+            "total_recall": int(min(500, total_recall)),
+            "memory": memory,
+            "pseudo_query_count": len(pseudo_queries),
+        }
 
     def run(
         self,
@@ -691,6 +990,7 @@ class RoutingRecallAgent:
         seen_history_lookback: int = 5000,
         filter_candidates_by_item_type: bool = True,
         candidate_item_ids_scope: Optional[Sequence[str]] = None,
+        adaptive_embedding_max_total_recall: int = 500,
         save_output: bool = True,
         output_dir: str | Path = "./processed/intent_dual_recall_outputs",
     ) -> IntentDualRecallOutput:
@@ -722,6 +1022,8 @@ class RoutingRecallAgent:
         if not routing.category_paths and routing.item_types:
             routing.category_paths = [[routing.item_types[0]]]
 
+        scope_ids = {str(x).strip() for x in (candidate_item_ids_scope or []) if str(x).strip()}
+
         if filter_candidates_by_item_type:
             candidate_items, final_rollup_paths = self.accessor.recall_global_items(
                 routing.category_paths,
@@ -735,6 +1037,23 @@ class RoutingRecallAgent:
                 max_items=max_candidate_items,
             )
             final_rollup_paths = [list(p) for p in routing.category_paths]
+
+        adaptive_candidates, adaptive_state = self._adaptive_weighted_embedding_recall(
+            user_id=str(user_id),
+            query=clean_query,
+            item_scope_ids=(scope_ids if scope_ids else None),
+            max_total_recall=min(500, int(adaptive_embedding_max_total_recall)),
+        )
+        if adaptive_candidates:
+            merged = []
+            seen = set()
+            for item in [*candidate_items, *adaptive_candidates]:
+                iid = str(item.get("item_id", "")).strip()
+                if not iid or iid in seen:
+                    continue
+                seen.add(iid)
+                merged.append(item)
+            candidate_items = merged
 
         if clean_query:
             history_rows: List[Dict[str, Any]] = []
@@ -796,6 +1115,7 @@ class RoutingRecallAgent:
                 "final_rollup_paths": final_rollup_paths,
                 "filter_candidates_by_item_type": bool(filter_candidates_by_item_type),
                 "candidate_item_scope_size": len(candidate_item_ids_scope or []),
+                "adaptive_embedding_state": adaptive_state,
                 "catalog_size": {
                     "category_paths": len(category_catalog),
                     "item_types": len(item_type_catalog),
