@@ -596,8 +596,33 @@ def _adaptive_embedding_fusion(
     max_total_recall: int = 500,
     max_pseudo_queries: int = 8,
 ) -> Tuple[List[str], Dict[str, Any]]:
+    def _safe_rank(rank: int) -> int:
+        return int(rank if rank < 10**9 else 5000)
+
+    def _rank_strength(rank: int) -> float:
+        safe = _safe_rank(rank)
+        return 1.0 / math.log2(safe + 2.0)
+
+    def _estimate_total_k(history: List[Dict[str, Any]], hard_cap: int) -> int:
+        if not history:
+            return int(max(50, min(500, hard_cap)))
+        required: List[float] = []
+        for row in history:
+            t_rank = _safe_rank(int(row.get("text_rank", 5000)))
+            v_rank = _safe_rank(int(row.get("vl_rank", 5000)))
+            t_w = float(row.get("weights", {}).get("text", 0.5))
+            v_w = float(row.get("weights", {}).get("vl", 0.5))
+            low_rank = min(t_rank, v_rank)
+            high_rank = max(t_rank, v_rank)
+            dominance = abs(t_w - v_w)
+            required.append(low_rank * (1.15 + 0.35 * dominance) + 0.15 * high_rank)
+        required.sort()
+        pivot = required[int(0.75 * (len(required) - 1))]
+        return int(max(50, min(500, min(hard_cap, round(pivot)))))
+
     text_weight = 0.5
     vl_weight = 0.5
+    history_target_text = 0.5
     total_k = int(max(50, min(500, max_total_recall)))
     memory: List[Dict[str, Any]] = []
 
@@ -607,45 +632,53 @@ def _adaptive_embedding_fusion(
 
     text_rank_map = _rank_position_map(text_rank_indices, filtered_item_ids)
     vl_rank_map = _rank_position_map(qwen3vl_rank_indices, filtered_item_ids)
-    text_top5 = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:5]]
-    vl_top5 = [filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:5]]
     pseudo_targets = [iid for iid in history_ids if iid in text_rank_map][: max(1, int(max_pseudo_queries))]
     for step, iid in enumerate(pseudo_targets, start=1):
         prev_text_weight = text_weight
         prev_vl_weight = vl_weight
         text_rank = text_rank_map.get(iid, 10**9)
         vl_rank = vl_rank_map.get(iid, 10**9)
-        gap = abs(text_rank - vl_rank)
-        delta = max(0.02, min(0.12, gap / 200.0))
+        text_strength = _rank_strength(text_rank)
+        vl_strength = _rank_strength(vl_rank)
+        strength_sum = max(1e-8, text_strength + vl_strength)
+        strength_target_text = text_strength / strength_sum
+        low_rank = min(_safe_rank(text_rank), _safe_rank(vl_rank))
+        gap = abs(_safe_rank(text_rank) - _safe_rank(vl_rank))
+        confidence = min(1.0, abs(math.log((_safe_rank(vl_rank) + 1) / (_safe_rank(text_rank) + 1))) / 1.6)
+        cover_share = min(0.95, max(0.5, low_rank / max(1.0, float(total_k))))
+        gap_bonus = min(0.15, math.log1p(gap) / 40.0)
+        dominant_share = min(0.95, max(0.8, cover_share + gap_bonus))
         if text_rank < vl_rank:
-            text_weight = max(0.1, min(0.9, text_weight + delta))
+            step_target_text = dominant_share
         elif vl_rank < text_rank:
-            text_weight = max(0.1, min(0.9, text_weight - delta))
+            step_target_text = 1.0 - dominant_share
+        else:
+            step_target_text = 0.5
+        step_target_text = 0.45 * strength_target_text + 0.55 * step_target_text
+        history_target_text = 0.75 * history_target_text + 0.25 * step_target_text
+        max_step_change = 0.05 + 0.07 * confidence
+        step_delta = max(-max_step_change, min(max_step_change, history_target_text - text_weight))
+        text_weight = max(0.05, min(0.95, text_weight + step_delta))
         vl_weight = 1.0 - text_weight
-        finite_ranks = [r for r in [text_rank, vl_rank] if r < 10**9]
-        if finite_ranks:
-            total_k = int(max(50, min(500, (min(finite_ranks) + max(finite_ranks)) * 2)))
         memory.append(
             {
                 "step": step,
                 "target_item_id": iid,
                 "text_rank": int(text_rank),
                 "vl_rank": int(vl_rank),
-                "path_top5": {"text": text_top5, "vl": vl_top5},
                 "weights_before": {"text": round(prev_text_weight, 4), "vl": round(prev_vl_weight, 4)},
                 "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
-                "estimated_total_recall": int(total_k),
                 "reasoning": (
-                    "text path ranks target higher; increase text weight"
-                    if text_rank < vl_rank
-                    else (
-                        "vl path ranks target higher; increase vl weight"
-                        if vl_rank < text_rank
-                        else "text/vl tie; keep balanced update"
-                    )
+                    f"strength_target={round(strength_target_text, 3)}, "
+                    f"dominant_share={round(dominant_share, 3)}, "
+                    f"confidence={round(confidence, 3)}, "
+                    f"history_target={round(history_target_text, 3)}; "
+                    "use history-smoothed extreme allocation (>=8:2 when modality differs)"
                 ),
             }
         )
+        total_k = _estimate_total_k(memory, int(max_total_recall))
+        memory[-1]["estimated_total_recall"] = int(total_k)
 
     text_k = max(1, int(round(total_k * text_weight)))
     vl_k = max(1, int(round(total_k * vl_weight)))
