@@ -661,6 +661,8 @@ def _adaptive_embedding_fusion(
     agent_final_params = _agent_finalize_params(memory, text_weight, vl_weight, total_k)
     text_weight = float(agent_final_params["text_weight"])
     vl_weight = float(agent_final_params["vl_weight"])
+    final_modal_weights = {"text": round(text_weight, 4), "vl": round(vl_weight, 4)}
+    final_modal_ratio = f"{int(round(text_weight * 100))}:{int(round(vl_weight * 100))}"
     text_k = max(1, int(round(total_k * text_weight)))
     vl_k = max(1, int(round(total_k * vl_weight)))
     text_ids = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:text_k]]
@@ -670,6 +672,8 @@ def _adaptive_embedding_fusion(
         "enabled": True,
         "text_weight": round(text_weight, 4),
         "vl_weight": round(vl_weight, 4),
+        "final_modal_weights": final_modal_weights,
+        "final_modal_ratio": final_modal_ratio,
         "total_recall": int(min(500, total_k)),
         "agent_final_params": agent_final_params,
         "pseudo_query_count": len(pseudo_targets),
@@ -1103,6 +1107,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             }
             if isinstance(agent_final_params, dict) and agent_final_params:
                 modal_params["agent_reasoning"] = str(agent_final_params.get("reasoning", ""))
+            modal_params["final_modal_ratio"] = str(adaptive_state.get("final_modal_ratio", ""))
+            modal_params["final_modal_weights"] = adaptive_state.get("final_modal_weights", {})
         else:
             text_pool = int(kw_debug.get("embedding_pool_size", 0))
             vl_pool = int(kw_debug.get("qwen3vl_pool_size", 0))

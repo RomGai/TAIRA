@@ -1023,6 +1023,8 @@ class RoutingRecallAgent:
         agent_final_params = _agent_finalize_params(memory, text_weight, vl_weight, total_recall)
         text_weight = float(agent_final_params["text_weight"])
         vl_weight = float(agent_final_params["vl_weight"])
+        final_modal_weights = {"text": round(text_weight, 4), "vl": round(vl_weight, 4)}
+        final_modal_ratio = f"{int(round(text_weight * 100))}:{int(round(vl_weight * 100))}"
         query_text_emb = self.query_embedding_model.encode(query)
         vl_model = self.vl_query_embedding_model or self.query_embedding_model
         try:
@@ -1067,6 +1069,8 @@ class RoutingRecallAgent:
             "enabled": True,
             "text_weight": round(text_weight, 4),
             "vl_weight": round(vl_weight, 4),
+            "final_modal_weights": final_modal_weights,
+            "final_modal_ratio": final_modal_ratio,
             "total_recall": int(min(500, total_recall)),
             "agent_final_params": agent_final_params,
             "memory": memory,
