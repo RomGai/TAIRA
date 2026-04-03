@@ -607,8 +607,12 @@ def _adaptive_embedding_fusion(
 
     text_rank_map = _rank_position_map(text_rank_indices, filtered_item_ids)
     vl_rank_map = _rank_position_map(qwen3vl_rank_indices, filtered_item_ids)
+    text_top5 = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:5]]
+    vl_top5 = [filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:5]]
     pseudo_targets = [iid for iid in history_ids if iid in text_rank_map][: max(1, int(max_pseudo_queries))]
     for step, iid in enumerate(pseudo_targets, start=1):
+        prev_text_weight = text_weight
+        prev_vl_weight = vl_weight
         text_rank = text_rank_map.get(iid, 10**9)
         vl_rank = vl_rank_map.get(iid, 10**9)
         gap = abs(text_rank - vl_rank)
@@ -627,8 +631,19 @@ def _adaptive_embedding_fusion(
                 "target_item_id": iid,
                 "text_rank": int(text_rank),
                 "vl_rank": int(vl_rank),
+                "path_top5": {"text": text_top5, "vl": vl_top5},
+                "weights_before": {"text": round(prev_text_weight, 4), "vl": round(prev_vl_weight, 4)},
                 "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
                 "estimated_total_recall": int(total_k),
+                "reasoning": (
+                    "text path ranks target higher; increase text weight"
+                    if text_rank < vl_rank
+                    else (
+                        "vl path ranks target higher; increase vl weight"
+                        if vl_rank < text_rank
+                        else "text/vl tie; keep balanced update"
+                    )
+                ),
             }
         )
 
@@ -1093,6 +1108,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "target_id": target_id,
                 "query": query,
                 "modal_modulation_params": modal_params,
+                "adaptive_embedding_state": adaptive_state if isinstance(adaptive_state, dict) else {},
             },
         )
         print(
