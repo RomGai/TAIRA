@@ -626,7 +626,16 @@ def _adaptive_embedding_fusion(
 
     text_rank_map = _rank_position_map(text_rank_indices, filtered_item_ids)
     vl_rank_map = _rank_position_map(qwen3vl_rank_indices, filtered_item_ids)
-    pseudo_targets = [iid for iid in history_ids if iid in text_rank_map][: max(1, int(max_pseudo_queries))]
+    history_candidates: List[str] = []
+    seen_history: set[str] = set()
+    for raw_iid in history_ids:
+        iid = str(raw_iid).strip()
+        if not iid or iid in seen_history:
+            continue
+        seen_history.add(iid)
+        if iid in meta_map:
+            history_candidates.append(iid)
+    pseudo_targets = history_candidates[: max(1, int(max_pseudo_queries))]
 
     for step, iid in enumerate(pseudo_targets, start=1):
         prev_text_weight = text_weight
@@ -695,6 +704,10 @@ def _adaptive_embedding_fusion(
         "final_modal_ratio": final_modal_ratio,
         "total_recall": int(min(500, total_k)),
         "agent_final_params": agent_final_params,
+        "history_item_count": len(history_candidates),
+        "history_items_in_recall_pool": int(
+            sum(1 for iid in pseudo_targets if iid in text_rank_map or iid in vl_rank_map)
+        ),
         "pseudo_query_count": len(pseudo_targets),
         "memory": memory,
     }
@@ -1035,7 +1048,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 kw_debug["merged_pool_size"] = len(top_ids)
         else:
             kw_debug["qwen3vl_enabled"] = False
-        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
+        history_ids = list(
+            dict.fromkeys(
+                x.strip() for x in str(row.get("remaining_interaction_string", "")).split("|") if x.strip()
+            )
+        )
         if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
             adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
                 base_query=q_sentence,
