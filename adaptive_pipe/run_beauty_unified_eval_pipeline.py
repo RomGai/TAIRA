@@ -134,6 +134,12 @@ def _save_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def _route_query(query: str, category_catalog: List[str], enable_llm: bool, text_model: str) -> Dict[str, Any]:
     if not enable_llm:
         return {
@@ -842,6 +848,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     category_catalog = sorted({_meta_category_text(v) for v in meta_map.values() if _meta_category_text(v)})
     results: List[Dict[str, Any]] = []
+    modal_trace_path = Path(args.output_dir) / "agent3_modal_modulation_trace.jsonl"
+    if modal_trace_path.exists():
+        modal_trace_path.unlink()
 
     for row_idx, row in query_df.iterrows():
         user_id = str(row["user_id"])
@@ -968,6 +977,34 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             top_ids = _merge_unique_ids(top_ids, adaptive_ids)
             used_k = len(top_ids)
             kw_debug["adaptive_embedding_state"] = adaptive_state
+        adaptive_state = kw_debug.get("adaptive_embedding_state", {}) if isinstance(kw_debug, dict) else {}
+        if isinstance(adaptive_state, dict) and adaptive_state.get("enabled"):
+            modal_params = {
+                "text_weight": float(adaptive_state.get("text_weight", 0.5)),
+                "vl_weight": float(adaptive_state.get("vl_weight", 0.5)),
+                "recall_size": int(adaptive_state.get("total_recall", len(top_ids))),
+                "source": "adaptive",
+            }
+        else:
+            text_pool = int(kw_debug.get("embedding_pool_size", 0))
+            vl_pool = int(kw_debug.get("qwen3vl_pool_size", 0))
+            denom = max(1, text_pool + vl_pool)
+            modal_params = {
+                "text_weight": float(text_pool / denom),
+                "vl_weight": float(vl_pool / denom),
+                "recall_size": int(kw_debug.get("merged_pool_size", len(top_ids))),
+                "source": "pool_ratio",
+            }
+        kw_debug["modal_modulation_params"] = modal_params
+        _append_jsonl(
+            modal_trace_path,
+            {
+                "user_id": user_id,
+                "target_id": target_id,
+                "query": query,
+                "modal_modulation_params": modal_params,
+            },
+        )
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
             f"stage={kw_debug['keyword_stage']} prefilter_size={len(filtered_item_ids)}"
