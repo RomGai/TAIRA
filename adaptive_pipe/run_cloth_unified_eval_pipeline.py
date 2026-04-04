@@ -385,21 +385,30 @@ def _repair_qwen3vl_cache_for_missing_ids(
         return cached_ids, cached_matrix
 
     print(f"[Agent3][Qwen3VL][repair] missing_ids={len(missing_ids)}; embedding missing only.")
-    missing_embs: List[np.ndarray] = []
-    embedded_ids: List[str] = []
+    repaired_missing_map: Dict[str, np.ndarray] = {}
     step = max(1, int(chunk_size))
     for start in range(0, len(missing_ids), step):
         end = min(len(missing_ids), start + step)
         sub_ids = missing_ids[start:end]
         sub_inputs = [_build_qwen3vl_item_input(meta_map[iid], image_url_to_local=image_url_to_local) for iid in sub_ids]
         sub_emb = _tensor_to_float32_numpy(qwen3vl_model.process(sub_inputs))
-        missing_embs.append(sub_emb)
-        embedded_ids.extend(sub_ids)
+        if sub_emb.ndim != 2:
+            sub_emb = np.atleast_2d(sub_emb)
+        produced = int(sub_emb.shape[0])
+        expected = len(sub_ids)
+        if produced != expected:
+            print(
+                f"[Agent3][Qwen3VL][repair] chunk size mismatch: expected={expected}, produced={produced}; "
+                "only aligned prefix will be used."
+            )
+        use_n = min(expected, produced)
+        for iid, row in zip(sub_ids[:use_n], sub_emb[:use_n]):
+            repaired_missing_map[iid] = np.asarray(row, dtype=np.float32)
         del sub_inputs
         del sub_emb
         _cleanup_torch_cache()
 
-    if not missing_embs:
+    if not repaired_missing_map:
         return cached_ids, cached_matrix
 
     cache_map: Dict[str, np.ndarray] = {}
@@ -407,9 +416,7 @@ def _repair_qwen3vl_cache_for_missing_ids(
         if iid not in cache_map:
             cache_map[iid] = cached_matrix[idx]
 
-    new_emb = np.concatenate(missing_embs, axis=0)
-    for idx, iid in enumerate(embedded_ids):
-        cache_map[iid] = new_emb[idx]
+    cache_map.update(repaired_missing_map)
 
     repaired_ids: List[str] = []
     repaired_rows: List[np.ndarray] = []
@@ -747,6 +754,38 @@ def _adaptive_embedding_fusion(
     }
 
 
+def _filter_item_ids_by_categories(
+    candidate_item_ids: List[str],
+    meta_map: Dict[str, Dict[str, Any]],
+    selected_categories: List[List[str]],
+) -> List[str]:
+    """Exact-match prefilter by Agent3 selected category paths.
+
+    Matching rule: any selected category path exactly equals one of item's category paths.
+    """
+    if not selected_categories:
+        return candidate_item_ids
+
+    selected_set = {
+        tuple(str(seg).strip().lower() for seg in path if str(seg).strip())
+        for path in selected_categories
+        if isinstance(path, list)
+    }
+    selected_set = {x for x in selected_set if x}
+    if not selected_set:
+        return candidate_item_ids
+
+    filtered: List[str] = []
+    for iid in candidate_item_ids:
+        meta = meta_map.get(iid, {})
+        item_paths = {
+            tuple(str(seg).strip().lower() for seg in path if str(seg).strip())
+            for path in _meta_category_paths(meta)
+        }
+        if item_paths & selected_set:
+            filtered.append(iid)
+    return filtered
+
 
 def _recall_at_k(labels: List[int], k: int) -> float:
     if not labels:
@@ -940,6 +979,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     item_emb_norm = _l2_normalize(item_emb_matrix)
     qwen3vl_model = None
     qwen3vl_item_emb_norm: np.ndarray | None = None
+    qwen3vl_item_id_to_index: Dict[str, int] = {}
     if args.enable_agent3_qwen3vl_embedding:
         try:
             from adaptive_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
@@ -1000,6 +1040,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     category_catalog = sorted({_meta_category_text(v) for v in meta_map.values() if _meta_category_text(v)})
     results: List[Dict[str, Any]] = []
+    skipped_users_missing_target_embedding = 0
     modal_trace_path = Path(args.output_dir) / "agent3_modal_modulation_trace.jsonl"
     if modal_trace_path.exists():
         modal_trace_path.unlink()
@@ -1020,6 +1061,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             continue
         if existing_output.exists():
             print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
+
+        target_in_text_embedding = target_id in item_id_to_index
+        target_in_vl_embedding = (
+            (not bool(getattr(args, "enable_agent3_qwen3vl_embedding", False)))
+            or (target_id in qwen3vl_item_id_to_index)
+        )
+        if (not target_in_text_embedding) or (not target_in_vl_embedding):
+            print(
+                f"[UserLoop] skip user={user_id}: target={target_id} missing embedding "
+                f"(text={target_in_text_embedding}, vl={target_in_vl_embedding})"
+            )
+            skipped_users_missing_target_embedding += 1
+            continue
 
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.text_model)
 
@@ -1307,7 +1361,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     _save_json(Path(args.output_dir) / "unified_eval_results.json", results)
 
     recall_rate = float(np.mean([r["hit"] for r in results])) if results else 0.0
-    summary = {"rows": len(results), "recall@k": recall_rate, "output_dir": args.output_dir}
+    summary = {
+        "rows": len(results),
+        "recall@k": recall_rate,
+        "output_dir": args.output_dir,
+        "skipped_users_missing_target_embedding": int(skipped_users_missing_target_embedding),
+    }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 
@@ -1333,15 +1392,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
     parser.add_argument("--enable-agent3-adaptive-weighting", action="store_true", help="开启Agent3基于历史伪查询的text/vl自适应权重迭代。")
-<<<<<<< codex/improve-agent-reasoning-for-ranking-adjustment-uet8m5
     parser.add_argument(
         "--agent3-query-recall-pool",
         choices=["filtered", "full"],
         default="filtered",
         help="控制真实query召回候选池：filtered=categories过滤后；full=全库。",
     )
-=======
->>>>>>> master
     parser.add_argument("--agent3-adaptive-min-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量下限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-total-recall", type=int, default=500, help="Agent3 text+vl融合召回总量上限（<=500）。")
     parser.add_argument("--agent3-adaptive-max-pseudo-queries", type=int, default=8, help="Agent3每次最多使用多少历史商品构造伪查询。")
