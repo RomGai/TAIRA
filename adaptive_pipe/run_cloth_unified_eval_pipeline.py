@@ -979,6 +979,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     item_emb_norm = _l2_normalize(item_emb_matrix)
     qwen3vl_model = None
     qwen3vl_item_emb_norm: np.ndarray | None = None
+    qwen3vl_item_id_to_index: Dict[str, int] = {}
     if args.enable_agent3_qwen3vl_embedding:
         try:
             from adaptive_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
@@ -1039,6 +1040,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     category_catalog = sorted({_meta_category_text(v) for v in meta_map.values() if _meta_category_text(v)})
     results: List[Dict[str, Any]] = []
+    skipped_users_missing_target_embedding = 0
     modal_trace_path = Path(args.output_dir) / "agent3_modal_modulation_trace.jsonl"
     if modal_trace_path.exists():
         modal_trace_path.unlink()
@@ -1059,6 +1061,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             continue
         if existing_output.exists():
             print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
+
+        target_in_text_embedding = target_id in item_id_to_index
+        target_in_vl_embedding = (
+            (not bool(getattr(args, "enable_agent3_qwen3vl_embedding", False)))
+            or (target_id in qwen3vl_item_id_to_index)
+        )
+        if (not target_in_text_embedding) or (not target_in_vl_embedding):
+            print(
+                f"[UserLoop] skip user={user_id}: target={target_id} missing embedding "
+                f"(text={target_in_text_embedding}, vl={target_in_vl_embedding})"
+            )
+            skipped_users_missing_target_embedding += 1
+            continue
 
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.text_model)
 
@@ -1346,7 +1361,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     _save_json(Path(args.output_dir) / "unified_eval_results.json", results)
 
     recall_rate = float(np.mean([r["hit"] for r in results])) if results else 0.0
-    summary = {"rows": len(results), "recall@k": recall_rate, "output_dir": args.output_dir}
+    summary = {
+        "rows": len(results),
+        "recall@k": recall_rate,
+        "output_dir": args.output_dir,
+        "skipped_users_missing_target_embedding": int(skipped_users_missing_target_embedding),
+    }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 
