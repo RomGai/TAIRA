@@ -368,6 +368,7 @@ def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
 
 def _repair_qwen3vl_cache_for_missing_ids(
     qwen3vl_model: Any,
+    text_emb_model: SentenceTransformer,
     cache_path: Path,
     all_item_ids: List[str],
     cached_ids: List[str],
@@ -386,6 +387,7 @@ def _repair_qwen3vl_cache_for_missing_ids(
 
     print(f"[Agent3][Qwen3VL][repair] missing_ids={len(missing_ids)}; embedding missing only.")
     repaired_missing_map: Dict[str, np.ndarray] = {}
+    target_dim = int(cached_matrix.shape[1]) if cached_matrix.ndim == 2 and cached_matrix.shape[1] > 0 else 0
     step = max(1, int(chunk_size))
     for start in range(0, len(missing_ids), step):
         end = min(len(missing_ids), start + step)
@@ -394,6 +396,8 @@ def _repair_qwen3vl_cache_for_missing_ids(
         sub_emb = _tensor_to_float32_numpy(qwen3vl_model.process(sub_inputs))
         if sub_emb.ndim != 2:
             sub_emb = np.atleast_2d(sub_emb)
+        if target_dim <= 0 and sub_emb.ndim == 2 and sub_emb.shape[1] > 0:
+            target_dim = int(sub_emb.shape[1])
         produced = int(sub_emb.shape[0])
         expected = len(sub_ids)
         if produced != expected:
@@ -404,6 +408,28 @@ def _repair_qwen3vl_cache_for_missing_ids(
         use_n = min(expected, produced)
         for iid, row in zip(sub_ids[:use_n], sub_emb[:use_n]):
             repaired_missing_map[iid] = np.asarray(row, dtype=np.float32)
+
+        no_image_ids = [iid for iid in sub_ids if not _safe_meta_image(meta_map.get(iid, {}))]
+        if no_image_ids:
+            text_batch = [_item_sentence(meta_map[iid]) for iid in no_image_ids]
+            text_emb = _encode_texts(
+                text_emb_model,
+                text_batch,
+                batch_size=min(64, max(1, len(text_batch))),
+                prompt_name="passage",
+            ).astype(np.float32, copy=False)
+            if text_emb.ndim == 1:
+                text_emb = text_emb.reshape(1, -1)
+            if target_dim <= 0:
+                target_dim = int(text_emb.shape[1])
+            if text_emb.shape[1] != target_dim:
+                print(
+                    f"[Agent3][Qwen3VL][repair] text fallback dim mismatch: "
+                    f"text_dim={text_emb.shape[1]} vs vl_dim={target_dim}; skip text fallback for this chunk."
+                )
+            else:
+                for iid, row in zip(no_image_ids, text_emb):
+                    repaired_missing_map[iid] = np.asarray(row, dtype=np.float32)
         del sub_inputs
         del sub_emb
         _cleanup_torch_cache()
@@ -1008,6 +1034,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             if q_item_emb_matrix is not None:
                 q_item_ids_cached, q_item_emb_matrix = _repair_qwen3vl_cache_for_missing_ids(
                     qwen3vl_model=qwen3vl_model,
+                    text_emb_model=emb_model,
                     cache_path=qwen3vl_emb_cache_path,
                     all_item_ids=all_item_ids,
                     cached_ids=q_item_ids_cached,
