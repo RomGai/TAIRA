@@ -1029,6 +1029,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if args.max_users > 0:
         query_df = query_df.head(args.max_users)
 
+    keyword_recall_topk = int(
+        args.keyword_recall_topk if int(getattr(args, "keyword_recall_topk", 0)) > 0 else args.agent3_keyword_topk
+    )
+    embedding_recall_topk = int(
+        args.embedding_recall_topk
+        if int(getattr(args, "embedding_recall_topk", 0)) > 0
+        else args.agent3_embedding_topk
+    )
+
     meta_map = load_filtered_meta(Path(args.filtered_meta_jsonl))
     if not meta_map:
         raise ValueError(f"No items loaded from filtered meta: {args.filtered_meta_jsonl}")
@@ -1208,8 +1217,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             "keyword_pool_size": 0,
                             "embedding_pool_size": 0,
                             "merged_pool_size": 0,
-                            "keyword_recall_topk": int(args.agent3_keyword_topk),
-                            "embedding_recall_topk": int(args.agent3_embedding_topk),
+                            "keyword_recall_topk": int(keyword_recall_topk),
+                            "embedding_recall_topk": int(embedding_recall_topk),
                             "prefilter_candidate_size": 0,
                         },
                     }
@@ -1231,14 +1240,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         hybrid_embedding_topk = (
             0
             if bool(getattr(args, "enable_agent3_adaptive_weighting", False))
-            else int(args.agent3_embedding_topk)
+            else int(embedding_recall_topk)
         )
         top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
             all_item_ids=filtered_item_ids,
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
-            keyword_recall_topk=args.agent3_keyword_topk,
+            keyword_recall_topk=keyword_recall_topk,
             embedding_recall_topk=hybrid_embedding_topk,
         )
         qwen3vl_rank_indices = None
@@ -1473,6 +1482,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-save-every", type=int, default=20000)
     parser.add_argument("--agent3-keyword-topk", type=int, default=250, help="Agent3基于标题关键词匹配的Top-K召回数量。")
     parser.add_argument("--agent3-embedding-topk", type=int, default=250, help="Agent3基于向量相似度的Top-K召回数量。")
+    parser.add_argument("--keyword-recall-topk", type=int, default=0, help="兼容cloth命名；>0时覆盖--agent3-keyword-topk。")
+    parser.add_argument("--embedding-recall-topk", type=int, default=0, help="兼容cloth命名；>0时覆盖--agent3-embedding-topk。")
     parser.add_argument("--enable-agent3-qwen3vl-embedding", action="store_true", help="开启后，Agent3新增一路Qwen3-VL多模态embedding召回（文本+图片）。默认关闭。")
     parser.add_argument("--agent3-qwen3vl-topk", type=int, default=25, help="Agent3新增Qwen3-VL多模态embedding召回Top-K。")
     parser.add_argument("--agent3-qwen3vl-model", default="Qwen/Qwen3-VL-Embedding-2B", help="Agent3多模态embedding模型名称。")
