@@ -1128,12 +1128,22 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 save_every_items=max(1, int(args.agent3_qwen3vl_save_every)),
                 image_url_to_local=image_url_to_local,
             )
-            q_item_ids_cached = list(all_item_ids)
+            q_item_ids_cached = list(all_item_ids[: int(q_item_emb_matrix.shape[0])])
         elif q_item_ids_cached != all_item_ids:
             print(
                 "[Agent3][Qwen3VL] cache still partial after repair; "
                 "skip full rebuild and use available embedded subset only."
             )
+        q_aligned = min(len(q_item_ids_cached), int(q_item_emb_matrix.shape[0]))
+        if q_aligned <= 0:
+            raise ValueError("[Agent3][Qwen3VL] empty embedding matrix after cache build/repair.")
+        if q_aligned != len(q_item_ids_cached) or q_aligned != int(q_item_emb_matrix.shape[0]):
+            print(
+                f"[Agent3][Qwen3VL] align id/emb mismatch: ids={len(q_item_ids_cached)} "
+                f"emb_rows={int(q_item_emb_matrix.shape[0])}; use aligned={q_aligned}"
+            )
+            q_item_ids_cached = q_item_ids_cached[:q_aligned]
+            q_item_emb_matrix = q_item_emb_matrix[:q_aligned]
         qwen3vl_item_emb_norm = _l2_normalize(q_item_emb_matrix)
         qwen3vl_item_id_to_index = {iid: idx for idx, iid in enumerate(q_item_ids_cached)}
     global_db = GlobalItemDB(args.global_db)
