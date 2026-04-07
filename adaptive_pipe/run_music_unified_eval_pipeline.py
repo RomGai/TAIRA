@@ -443,6 +443,7 @@ def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
 
 def _repair_qwen3vl_cache_for_missing_ids(
     qwen3vl_model: Any,
+    text_emb_model: SentenceTransformer,
     cache_path: Path,
     all_item_ids: List[str],
     cached_ids: List[str],
@@ -460,21 +461,55 @@ def _repair_qwen3vl_cache_for_missing_ids(
         return cached_ids, cached_matrix
 
     print(f"[Agent3][Qwen3VL][repair] missing_ids={len(missing_ids)}; embedding missing only.")
-    missing_embs: List[np.ndarray] = []
-    embedded_ids: List[str] = []
+    repaired_missing_map: Dict[str, np.ndarray] = {}
+    target_dim = int(cached_matrix.shape[1]) if cached_matrix.ndim == 2 and cached_matrix.shape[1] > 0 else 0
     step = max(1, int(chunk_size))
     for start in range(0, len(missing_ids), step):
         end = min(len(missing_ids), start + step)
         sub_ids = missing_ids[start:end]
         sub_inputs = [_build_qwen3vl_item_input(meta_map[iid], image_url_to_local=image_url_to_local) for iid in sub_ids]
         sub_emb = _tensor_to_float32_numpy(qwen3vl_model.process(sub_inputs))
-        missing_embs.append(sub_emb)
-        embedded_ids.extend(sub_ids)
+        if sub_emb.ndim != 2:
+            sub_emb = np.atleast_2d(sub_emb)
+        if target_dim <= 0 and sub_emb.ndim == 2 and sub_emb.shape[1] > 0:
+            target_dim = int(sub_emb.shape[1])
+        produced = int(sub_emb.shape[0])
+        expected = len(sub_ids)
+        if produced != expected:
+            print(
+                f"[Agent3][Qwen3VL][repair] chunk size mismatch: expected={expected}, produced={produced}; "
+                "only aligned prefix will be used."
+            )
+        use_n = min(expected, produced)
+        for iid, row in zip(sub_ids[:use_n], sub_emb[:use_n]):
+            repaired_missing_map[iid] = np.asarray(row, dtype=np.float32)
+
+        no_image_ids = [iid for iid in sub_ids if not _safe_meta_image(meta_map.get(iid, {}))]
+        if no_image_ids:
+            text_batch = [_item_sentence(meta_map[iid]) for iid in no_image_ids]
+            text_emb = _encode_texts(
+                text_emb_model,
+                text_batch,
+                batch_size=min(64, max(1, len(text_batch))),
+                prompt_name="passage",
+            ).astype(np.float32, copy=False)
+            if text_emb.ndim == 1:
+                text_emb = text_emb.reshape(1, -1)
+            if target_dim <= 0:
+                target_dim = int(text_emb.shape[1])
+            if text_emb.shape[1] != target_dim:
+                print(
+                    f"[Agent3][Qwen3VL][repair] text fallback dim mismatch: "
+                    f"text_dim={text_emb.shape[1]} vs vl_dim={target_dim}; skip text fallback for this chunk."
+                )
+            else:
+                for iid, row in zip(no_image_ids, text_emb):
+                    repaired_missing_map[iid] = np.asarray(row, dtype=np.float32)
         del sub_inputs
         del sub_emb
         _cleanup_torch_cache()
 
-    if not missing_embs:
+    if not repaired_missing_map:
         return cached_ids, cached_matrix
 
     cache_map: Dict[str, np.ndarray] = {}
@@ -482,9 +517,7 @@ def _repair_qwen3vl_cache_for_missing_ids(
         if iid not in cache_map:
             cache_map[iid] = cached_matrix[idx]
 
-    new_emb = np.concatenate(missing_embs, axis=0)
-    for idx, iid in enumerate(embedded_ids):
-        cache_map[iid] = new_emb[idx]
+    cache_map.update(repaired_missing_map)
 
     repaired_ids: List[str] = []
     repaired_rows: List[np.ndarray] = []
@@ -996,6 +1029,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if args.max_users > 0:
         query_df = query_df.head(args.max_users)
 
+    keyword_recall_topk = int(
+        args.keyword_recall_topk if int(getattr(args, "keyword_recall_topk", 0)) > 0 else args.agent3_keyword_topk
+    )
+    embedding_recall_topk = int(
+        args.embedding_recall_topk
+        if int(getattr(args, "embedding_recall_topk", 0)) > 0
+        else args.agent3_embedding_topk
+    )
+
     meta_map = load_filtered_meta(Path(args.filtered_meta_jsonl))
     if not meta_map:
         raise ValueError(f"No items loaded from filtered meta: {args.filtered_meta_jsonl}")
@@ -1038,6 +1080,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     item_emb_norm = _l2_normalize(item_emb_matrix)
     qwen3vl_model = None
     qwen3vl_item_emb_norm: np.ndarray | None = None
+    qwen3vl_item_id_to_index: Dict[str, int] = {}
     if args.enable_agent3_qwen3vl_embedding:
         try:
             from adaptive_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
@@ -1066,6 +1109,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             if q_item_emb_matrix is not None:
                 q_item_ids_cached, q_item_emb_matrix = _repair_qwen3vl_cache_for_missing_ids(
                     qwen3vl_model=qwen3vl_model,
+                    text_emb_model=emb_model,
                     cache_path=qwen3vl_emb_cache_path,
                     all_item_ids=all_item_ids,
                     cached_ids=q_item_ids_cached,
@@ -1084,12 +1128,22 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 save_every_items=max(1, int(args.agent3_qwen3vl_save_every)),
                 image_url_to_local=image_url_to_local,
             )
-            q_item_ids_cached = list(all_item_ids)
+            q_item_ids_cached = list(all_item_ids[: int(q_item_emb_matrix.shape[0])])
         elif q_item_ids_cached != all_item_ids:
             print(
                 "[Agent3][Qwen3VL] cache still partial after repair; "
                 "skip full rebuild and use available embedded subset only."
             )
+        q_aligned = min(len(q_item_ids_cached), int(q_item_emb_matrix.shape[0]))
+        if q_aligned <= 0:
+            raise ValueError("[Agent3][Qwen3VL] empty embedding matrix after cache build/repair.")
+        if q_aligned != len(q_item_ids_cached) or q_aligned != int(q_item_emb_matrix.shape[0]):
+            print(
+                f"[Agent3][Qwen3VL] align id/emb mismatch: ids={len(q_item_ids_cached)} "
+                f"emb_rows={int(q_item_emb_matrix.shape[0])}; use aligned={q_aligned}"
+            )
+            q_item_ids_cached = q_item_ids_cached[:q_aligned]
+            q_item_emb_matrix = q_item_emb_matrix[:q_aligned]
         qwen3vl_item_emb_norm = _l2_normalize(q_item_emb_matrix)
         qwen3vl_item_id_to_index = {iid: idx for idx, iid in enumerate(q_item_ids_cached)}
     global_db = GlobalItemDB(args.global_db)
@@ -1098,6 +1152,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     category_catalog = sorted({_meta_category_text(v) for v in meta_map.values() if _meta_category_text(v)})
     results: List[Dict[str, Any]] = []
+    skipped_users_missing_target_embedding = 0
     modal_trace_path = Path(args.output_dir) / "agent3_modal_modulation_trace.jsonl"
     if modal_trace_path.exists():
         modal_trace_path.unlink()
@@ -1118,6 +1173,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             continue
         if existing_output.exists():
             print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
+
+        target_in_text_embedding = target_id in item_id_to_index
+        target_in_vl_embedding = (
+            (not bool(getattr(args, "enable_agent3_qwen3vl_embedding", False)))
+            or (target_id in qwen3vl_item_id_to_index)
+        )
+        if (not target_in_text_embedding) or (not target_in_vl_embedding):
+            print(
+                f"[UserLoop] skip user={user_id}: target={target_id} missing embedding "
+                f"(text={target_in_text_embedding}, vl={target_in_vl_embedding})"
+            )
+            skipped_users_missing_target_embedding += 1
+            continue
 
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.text_model)
 
@@ -1159,8 +1227,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             "keyword_pool_size": 0,
                             "embedding_pool_size": 0,
                             "merged_pool_size": 0,
-                            "keyword_recall_topk": int(args.agent3_keyword_topk),
-                            "embedding_recall_topk": int(args.agent3_embedding_topk),
+                            "keyword_recall_topk": int(keyword_recall_topk),
+                            "embedding_recall_topk": int(embedding_recall_topk),
                             "prefilter_candidate_size": 0,
                         },
                     }
@@ -1182,14 +1250,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         hybrid_embedding_topk = (
             0
             if bool(getattr(args, "enable_agent3_adaptive_weighting", False))
-            else int(args.agent3_embedding_topk)
+            else int(embedding_recall_topk)
         )
         top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
             all_item_ids=filtered_item_ids,
             title_lower_map=title_lower_map,
             keywords=keywords,
             rank_indices=rank_indices,
-            keyword_recall_topk=args.agent3_keyword_topk,
+            keyword_recall_topk=keyword_recall_topk,
             embedding_recall_topk=hybrid_embedding_topk,
         )
         qwen3vl_rank_indices = None
@@ -1404,7 +1472,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     _save_json(Path(args.output_dir) / "unified_eval_results.json", results)
 
     recall_rate = float(np.mean([r["hit"] for r in results])) if results else 0.0
-    summary = {"rows": len(results), "recall@k": recall_rate, "output_dir": args.output_dir}
+    summary = {
+        "rows": len(results),
+        "recall@k": recall_rate,
+        "output_dir": args.output_dir,
+        "skipped_users_missing_target_embedding": int(skipped_users_missing_target_embedding),
+    }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 
@@ -1419,6 +1492,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-save-every", type=int, default=20000)
     parser.add_argument("--agent3-keyword-topk", type=int, default=250, help="Agent3基于标题关键词匹配的Top-K召回数量。")
     parser.add_argument("--agent3-embedding-topk", type=int, default=250, help="Agent3基于向量相似度的Top-K召回数量。")
+    parser.add_argument("--keyword-recall-topk", type=int, default=0, help="兼容cloth命名；>0时覆盖--agent3-keyword-topk。")
+    parser.add_argument("--embedding-recall-topk", type=int, default=0, help="兼容cloth命名；>0时覆盖--agent3-embedding-topk。")
     parser.add_argument("--enable-agent3-qwen3vl-embedding", action="store_true", help="开启后，Agent3新增一路Qwen3-VL多模态embedding召回（文本+图片）。默认关闭。")
     parser.add_argument("--agent3-qwen3vl-topk", type=int, default=25, help="Agent3新增Qwen3-VL多模态embedding召回Top-K。")
     parser.add_argument("--agent3-qwen3vl-model", default="Qwen/Qwen3-VL-Embedding-2B", help="Agent3多模态embedding模型名称。")
