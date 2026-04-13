@@ -37,6 +37,9 @@ class ItemRetrievalAgent(Agent):
         super().__init__("ItemRetrievalAgent", memory)
         with open('system_config.yaml') as f:
             self.config = yaml.load(f, Loader=yaml.FullLoader)
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for ItemRetrievalAgent, but no GPU is available.")
+        self.embedding_device = 'cuda'
         self.domain = self.config['DOMAIN']
         self.domain_path = "data/" + self.domain
         # print(1)
@@ -73,7 +76,7 @@ class ItemRetrievalAgent(Agent):
         if os.path.exists(self.embedding_file):
             self.project_embeddings = np.load(self.embedding_file)
         else:
-            model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+            model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True, device=self.embedding_device)
             project_texts = self.df['project_info'].tolist()
             # Debugging information
             for text in project_texts:
@@ -91,6 +94,7 @@ class ItemRetrievalAgent(Agent):
         tokenized_corpus = [word_tokenize(doc.lower()) for doc in self.corpus]
         self.bm25 = BM25Okapi(tokenized_corpus)
         print("complete bm25")
+        print(f"ItemRetrievalAgent embedding device: {self.embedding_device}")
 
     def parse_user_input(self, user_input):
         history = self.memory.get_history()
@@ -114,7 +118,7 @@ class ItemRetrievalAgent(Agent):
         return structured_preferences
 
     def recommend_projects_with_bge_m3(self, user_query, top_n=1000, initial_filter=1000):
-        model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+        model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True, device=self.embedding_device)
         # if self.domain == 'amazon_clothing':
         # 从用户查询中提取 base_type
         base_type = user_query.split(";")[0].strip()
@@ -152,9 +156,7 @@ class ItemRetrievalAgent(Agent):
         return filtered_df
 
     def recommend_projects_with_bge_m3_base(self, user_query, top_n=500):
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        # print(device)
-        model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True, device=device)
+        model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True, device=self.embedding_device)
         query_embedding = model.encode([user_query], batch_size=1, max_length=8192)['dense_vecs']
         similarity_scores = compute_similarity(query_embedding, self.project_embeddings)[0]
         similarity_scores = np.array(similarity_scores, dtype=np.float32)
@@ -167,7 +169,7 @@ class ItemRetrievalAgent(Agent):
         return top_n_projects
 
     def recommend_projects_with_fuzzy(self, user_query, top_n=500, initial_filter=100):
-        model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+        model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True, device=self.embedding_device)
         # if self.domain == 'amazon_clothing':
         # 从用户查询中提取 base_type
         base_type = user_query.split(";")[0].strip()
@@ -229,7 +231,7 @@ class ItemRetrievalAgent(Agent):
         return top_k_projects
 
     def recommend_projects_with_reranker_base(self, user_query, top_k=10):
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = self.embedding_device
         top_k = self.config['TOPK_ITEMS']
         top_n = self.config['TOPN_ITEMS']
         reference = self.parse_user_input(user_query)
@@ -255,7 +257,7 @@ class ItemRetrievalAgent(Agent):
         return top_k_projects
 
     def execute_task(self, query):
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = self.embedding_device
         top_k = self.config['TOPK_ITEMS']
         top_n = self.config['TOPN_ITEMS']
         reference = self.parse_user_input(query)
@@ -279,5 +281,3 @@ class ItemRetrievalAgent(Agent):
         filtered_df = self.item_df[self.item_df['similarity_score'] >= threshold]
 
         return filtered_df
-
-
