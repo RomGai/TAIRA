@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -60,22 +61,31 @@ def _run_once(user_input, current_query, agents, memory, pipeline_steps, round_i
     final_json = {'recommendations': []}
 
     if 'search' in pipeline_steps:
+        print(f'[Reflexion] Round {round_id}: start search...')
         search_query = f'{current_query}'
+        started = time.time()
         search_output = str(searcher_agent.execute_task(search_query))
         memory.add_observation('SearcherAgent', search_query, search_output)
         current_query = search_output
+        print(f'[Reflexion] Round {round_id}: search done in {time.time() - started:.1f}s')
         logger.debug('[Round %s] search observation: %s', round_id, search_output)
 
     if 'retrieve' in pipeline_steps:
+        print(f'[Reflexion] Round {round_id}: start retrieve...')
+        started = time.time()
         retrieval_df = item_agent.execute_task(current_query)
         retrieval_records = retrieval_df.to_dict(orient='records')
         memory.add_observation('ItemRetrievalAgent', current_query, retrieval_records)
+        print(f'[Reflexion] Round {round_id}: retrieve done in {time.time() - started:.1f}s, candidates={len(retrieval_records)}')
         logger.debug('[Round %s] retrieved candidates: %s', round_id, len(retrieval_records))
 
     if 'interact' in pipeline_steps:
+        print(f'[Reflexion] Round {round_id}: start interact (LLM generation)...')
         instruction = f'Reflexion round {round_id}: generate recommendation for query: {user_input}'
+        started = time.time()
         final_response = interactor_agent.generate_response(instruction)
         memory.add_observation('InteractorAgent', instruction, final_response)
+        print(f'[Reflexion] Round {round_id}: interact done in {time.time() - started:.1f}s')
         final_json = _parse_interactor_json(final_response)
 
     return retrieval_records, final_json

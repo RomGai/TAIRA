@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -67,29 +68,38 @@ def run_react_query(memory, row, agents, logger, pipeline_steps, max_turns, fina
 
     for turn in range(1, max_turns + 1):
         if 'search' in pipeline_steps and (turn == 1 or not retrieval_records):
+            print(f'[ReAct] Turn {turn}: start search...')
             thought = f'Turn {turn} thought: need more external knowledge.'
             memory.add_thought({'react_thought': thought})
             logger.debug(thought)
+            started = time.time()
             current_query = str(searcher_agent.execute_task(current_query))
             memory.add_observation('SearcherAgent', 'search', current_query)
+            print(f'[ReAct] Turn {turn}: search done in {time.time() - started:.1f}s')
             logger.debug('Turn %s action=search observation=%s', turn, current_query)
 
         if 'retrieve' in pipeline_steps:
+            print(f'[ReAct] Turn {turn}: start retrieve...')
             thought = f'Turn {turn} thought: retrieve candidate items from current hypothesis.'
             memory.add_thought({'react_thought': thought})
             logger.debug(thought)
+            started = time.time()
             retrieval_df = item_agent.execute_task(current_query)
             retrieval_records = retrieval_df.to_dict(orient='records')
             memory.add_observation('ItemRetrievalAgent', current_query, retrieval_records)
+            print(f'[ReAct] Turn {turn}: retrieve done in {time.time() - started:.1f}s, candidates={len(retrieval_records)}')
             logger.debug('Turn %s action=retrieve candidates=%s', turn, len(retrieval_records))
 
         if 'interact' in pipeline_steps:
+            print(f'[ReAct] Turn {turn}: start interact (LLM generation)...')
             thought = f'Turn {turn} thought: aggregate observations and produce recommendation.'
             memory.add_thought({'react_thought': thought})
             logger.debug(thought)
             instruction = f'ReAct turn {turn}: produce recommendation for query: {user_input}'
+            started = time.time()
             final_response = interactor_agent.generate_response(instruction)
             memory.add_observation('InteractorAgent', instruction, final_response)
+            print(f'[ReAct] Turn {turn}: interact done in {time.time() - started:.1f}s')
             final_json = _parse_interactor_json(final_response)
 
             raw_ids = _extract_ranked_ids_from_response(
