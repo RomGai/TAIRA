@@ -164,10 +164,11 @@ def process_queries(df, dataset_path, config, args):
     agents = init_agents(memory, config)
     metric_columns = ['hit@10', 'ndcg@10', 'mrr@10', 'hit@20', 'ndcg@20', 'mrr@20', 'hit@40', 'ndcg@40', 'mrr@40']
     pipeline_steps = [step.strip() for step in args.pipeline.split(',') if step.strip()]
+    total_queries = len(df)
 
     for index, row in df.iterrows():
         logger = setup_logger(str(log_dir / f'log_{index + 1}.log'))
-        print(f'Processing query {index + 1}')
+        print(f'[Progress] Processing query {index + 1}/{total_queries} ({(index + 1) / max(total_queries, 1):.1%})')
         try:
             metrics, fail_flag, pattern_key = run_reflexion_query(
                 memory,
@@ -196,6 +197,13 @@ def process_queries(df, dataset_path, config, args):
 
         complete_df = pd.read_csv(results_csv, encoding='ISO-8859-1')
         _print_running_average(complete_df)
+        processed = len(complete_df)
+        print(
+            f"[AvgMetrics] processed={processed}/{total_queries} | "
+            f"HR@10={complete_df['hit@10'].mean():.4f} NDCG@10={complete_df['ndcg@10'].mean():.4f} MRR@10={complete_df['mrr@10'].mean():.4f} | "
+            f"HR@20={complete_df['hit@20'].mean():.4f} NDCG@20={complete_df['ndcg@20'].mean():.4f} MRR@20={complete_df['mrr@20'].mean():.4f} | "
+            f"HR@40={complete_df['hit@40'].mean():.4f} NDCG@40={complete_df['ndcg@40'].mean():.4f} MRR@40={complete_df['mrr@40'].mean():.4f}"
+        )
         memory.remove_data()
         logger.handlers.clear()
 
