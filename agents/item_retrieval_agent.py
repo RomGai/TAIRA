@@ -37,7 +37,9 @@ class ItemRetrievalAgent(Agent):
         super().__init__("ItemRetrievalAgent", memory)
         with open('system_config.yaml') as f:
             self.config = yaml.load(f, Loader=yaml.FullLoader)
-        self.embedding_device = self._resolve_embedding_device()
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for ItemRetrievalAgent, but no GPU is available.")
+        self.embedding_device = 'cuda'
         self.domain = self.config['DOMAIN']
         self.domain_path = "data/" + self.domain
         # print(1)
@@ -93,17 +95,6 @@ class ItemRetrievalAgent(Agent):
         self.bm25 = BM25Okapi(tokenized_corpus)
         print("complete bm25")
         print(f"ItemRetrievalAgent embedding device: {self.embedding_device}")
-
-    def _resolve_embedding_device(self):
-        force_gpu = str(os.environ.get('TAIRA_FORCE_GPU', '1')).lower() not in {'0', 'false', 'no'}
-        if torch.cuda.is_available():
-            return 'cuda'
-        if force_gpu:
-            raise RuntimeError(
-                "TAIRA_FORCE_GPU is enabled but CUDA is unavailable. "
-                "Please run with a GPU environment or set TAIRA_FORCE_GPU=0 to allow CPU fallback."
-            )
-        return 'cpu'
 
     def parse_user_input(self, user_input):
         history = self.memory.get_history()
@@ -290,4 +281,3 @@ class ItemRetrievalAgent(Agent):
         filtered_df = self.item_df[self.item_df['similarity_score'] >= threshold]
 
         return filtered_df
-
