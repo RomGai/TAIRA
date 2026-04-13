@@ -28,6 +28,12 @@ def parse_args():
     parser.add_argument('--config', default='system_config.yaml', help='Path to the YAML config file.')
     parser.add_argument('--data-dir', help='Dataset directory under data/, e.g. data/amazon_music.')
     parser.add_argument('--query-file', default='query_data1.csv', help='Query CSV filename inside the dataset directory.')
+    parser.add_argument(
+        '--execution-mode',
+        choices=['pipeline'],
+        default='pipeline',
+        help='Compatibility flag with main.py; only pipeline mode is supported in this script.',
+    )
     parser.add_argument('--pipeline', default='search,retrieve,interact', help='Pipeline actions to allow.')
     parser.add_argument('--query-number', type=int, help='Optional override for QUERY_NUMBER.')
     parser.add_argument('--classification-only', action='store_true', help='Only run rows where classification == 1.')
@@ -207,6 +213,9 @@ def process_queries(df, dataset_path, config, args):
 def main():
     args = parse_args()
     config = load_config(args.config)
+
+    if args.execution_mode != 'pipeline':
+        raise ValueError('main_reflexion.py only supports --execution-mode pipeline.')
 
     if args.query_number is not None:
         config['QUERY_NUMBER'] = args.query_number
