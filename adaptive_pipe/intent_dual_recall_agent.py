@@ -254,7 +254,6 @@ class Qwen3RouterLLM:
         self.load()
         memory_window = list(recent_memory[-5:]) if recent_memory else []
         context_payload = {
-            "query": query,
             "step": int(step),
             "target_item_id": str(target_item_id or ""),
             "pseudo_query": str(pseudo_query or ""),
