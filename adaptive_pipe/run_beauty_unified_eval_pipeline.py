@@ -416,6 +416,24 @@ def _repair_qwen3vl_cache_for_missing_ids(
     return repaired_ids, repaired_matrix
 
 
+def _align_cached_ids_and_matrix(
+    cached_ids: List[str],
+    cached_matrix: np.ndarray | None,
+    cache_name: str,
+) -> Tuple[List[str], np.ndarray | None]:
+    if cached_matrix is None:
+        return cached_ids, cached_matrix
+    matrix_rows = int(cached_matrix.shape[0])
+    if matrix_rows == len(cached_ids):
+        return cached_ids, cached_matrix
+    aligned = min(len(cached_ids), matrix_rows)
+    print(
+        f"[Agent3][{cache_name}] id/embedding row mismatch: "
+        f"ids={len(cached_ids)} rows={matrix_rows}; align to {aligned}."
+    )
+    return cached_ids[:aligned], cached_matrix[:aligned]
+
+
 def _extract_query_keywords(query: str, max_keywords: int) -> List[str]:
     tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", query.lower())
     uniq: List[str] = []
@@ -979,6 +997,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             q_npz = np.load(qwen3vl_emb_cache_path, allow_pickle=True)
             q_item_ids_cached = [str(x) for x in q_npz["item_ids"].tolist()]
             q_item_emb_matrix = q_npz["item_embeddings"].astype(np.float32, copy=False)
+            q_item_ids_cached, q_item_emb_matrix = _align_cached_ids_and_matrix(
+                q_item_ids_cached, q_item_emb_matrix, "Qwen3VL"
+            )
             if q_item_emb_matrix is not None:
                 q_item_ids_cached, q_item_emb_matrix = _repair_qwen3vl_cache_for_missing_ids(
                     qwen3vl_model=qwen3vl_model,
@@ -1006,6 +1027,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "[Agent3][Qwen3VL] cache still partial after repair; "
                 "skip full rebuild and use available embedded subset only."
             )
+        q_item_ids_cached, q_item_emb_matrix = _align_cached_ids_and_matrix(
+            q_item_ids_cached, q_item_emb_matrix, "Qwen3VL"
+        )
         qwen3vl_item_emb_norm = _l2_normalize(q_item_emb_matrix)
         qwen3vl_item_id_to_index = {iid: idx for idx, iid in enumerate(q_item_ids_cached)}
     global_db = GlobalItemDB(args.global_db)
@@ -1123,12 +1147,24 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 qwen3vl_rank_indices = None
                 qwen3vl_ids = []
             else:
-                qwen_filtered_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_filtered_item_ids]
+                qwen_filtered_pairs = [
+                    (iid, qwen3vl_item_id_to_index[iid])
+                    for iid in qwen_filtered_item_ids
+                    if qwen3vl_item_id_to_index[iid] < qwen3vl_item_emb_norm.shape[0]
+                ]
+                qwen_filtered_item_ids = [iid for iid, _ in qwen_filtered_pairs]
+                qwen_filtered_idx = [idx for _, idx in qwen_filtered_pairs]
                 q_filtered_emb = qwen3vl_item_emb_norm[np.array(qwen_filtered_idx)]
                 qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
                 qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
                 qwen_all_item_ids = [iid for iid in all_item_ids if iid in qwen3vl_item_id_to_index]
-                qwen_all_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_all_item_ids]
+                qwen_all_pairs = [
+                    (iid, qwen3vl_item_id_to_index[iid])
+                    for iid in qwen_all_item_ids
+                    if qwen3vl_item_id_to_index[iid] < qwen3vl_item_emb_norm.shape[0]
+                ]
+                qwen_all_item_ids = [iid for iid, _ in qwen_all_pairs]
+                qwen_all_idx = [idx for _, idx in qwen_all_pairs]
                 qwen_all_emb = qwen3vl_item_emb_norm[np.array(qwen_all_idx)]
                 qwen_all_sim = np.matmul(qwen_all_emb, qwen3vl_q_emb_norm)
                 qwen_sim_aligned = np.full(len(all_item_ids), -1e9, dtype=np.float32)
