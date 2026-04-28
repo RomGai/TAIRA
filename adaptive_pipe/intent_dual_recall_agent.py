@@ -183,6 +183,57 @@ class Qwen3RouterLLM:
             reasoning=str(payload.get("reasoning", "")),
         )
 
+    def rewrite_pseudo_query(self, real_query: str, history_item_info: Dict[str, Any]) -> str:
+        """Rewrite a pseudo query grounded on one history item while keeping query granularity."""
+        self.load()
+        clean_query = str(real_query or "").strip()
+        if not clean_query:
+            return ""
+
+        history_item_json = json.dumps(history_item_info or {}, ensure_ascii=False)
+        prompt = (
+            "You are an e-commerce retrieval query rewriting assistant.\n\n"
+            "Task:\n"
+            "Given the current real query and the basic information of a history item,\n"
+            "generate one pseudo query that satisfies all constraints:\n"
+            "1) Keep the same information granularity as the real query (neither broader nor narrower).\n"
+            "2) Preserve semantic slot structure as much as possible (e.g., category/brand/specs/effects/"
+            "target people/style/scenario/budget).\n"
+            "3) The content must point to the history item and be supported by its title/category/attributes; no fabrication.\n"
+            "4) Do not output a long descriptive sentence; output a short search query as a user would type.\n"
+            "5) If some slots are missing in the real query, do not invent new slots in the pseudo query.\n"
+            "6) If the real query has hard constraints (brand/model/size/compatibility/people), map them only when evidence exists "
+            "in the history item; otherwise keep a weakened expression with the same granularity.\n"
+            "7) Output exactly one line pseudo query only. No explanation.\n\n"
+            "Input:\n"
+            f"Real query:\n{clean_query}\n\n"
+            f"History item info (JSON):\n{history_item_json}\n\n"
+            "Output:\n"
+            "<one-line pseudo query>"
+        )
+        messages = [{"role": "user", "content": prompt}]
+        text = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
+        )
+        model_inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
+        generated_ids = self._model.generate(
+            **model_inputs,
+            max_new_tokens=min(256, int(self.max_new_tokens)),
+        )
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
+        try:
+            index = len(output_ids) - output_ids[::-1].index(151668)
+        except ValueError:
+            index = 0
+        content = self._tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n").strip()
+        if not content:
+            return ""
+        first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), content).strip()
+        return first_line.strip("\"'` ")
+
 
 class Qwen3QueryEmbeddingModel:
     """Query embedding wrapper for semantic history recall."""
@@ -823,8 +874,18 @@ class RoutingRecallAgent:
             if isinstance(text_tags, list) and text_tags:
                 text_hint = "，".join(str(x).strip() for x in text_tags[:3] if str(x).strip())
             pseudo = query
+            history_item_info = {
+                "item_id": item_id,
+                "title": str(profile.get("title", "") if isinstance(profile, dict) else ""),
+                "taxonomy": taxonomy if isinstance(taxonomy, dict) else {},
+                "text_tags": text_tags if isinstance(text_tags, (list, dict)) else text_hint,
+            }
             if category or item_type or text_hint:
-                pseudo = f"{query}（参考历史偏好：{item_type} {category} {text_hint}）".strip()
+                try:
+                    llm_pseudo = self.llm.rewrite_pseudo_query(real_query=query, history_item_info=history_item_info)
+                except Exception:
+                    llm_pseudo = ""
+                pseudo = llm_pseudo or f"{query}（参考历史偏好：{item_type} {category} {text_hint}）".strip()
             pseudo_queries.append({"item_id": item_id, "pseudo_query": pseudo})
             if len(pseudo_queries) >= max(1, int(max_pseudo_queries)):
                 break
