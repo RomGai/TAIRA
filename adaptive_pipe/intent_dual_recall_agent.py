@@ -234,6 +234,152 @@ class Qwen3RouterLLM:
         first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), content).strip()
         return first_line.strip("\"'` ")
 
+    def optimize_modulation_params(
+        self,
+        query: str,
+        step: int,
+        target_item_id: str,
+        pseudo_query: str,
+        text_rank: int,
+        vl_rank: int,
+        current_text_weight: float,
+        current_vl_weight: float,
+        current_total_recall: int,
+        rule_hints: Dict[str, Any],
+        recent_memory: Sequence[Dict[str, Any]],
+        min_total_recall: int,
+        max_total_recall: int,
+    ) -> Optional[Dict[str, Any]]:
+        """LLM-driven modulation optimizer for Agent3 adaptive dual-recall."""
+        self.load()
+        memory_window = list(recent_memory[-5:]) if recent_memory else []
+        context_payload = {
+            "query": query,
+            "step": int(step),
+            "target_item_id": str(target_item_id or ""),
+            "pseudo_query": str(pseudo_query or ""),
+            "observation": {"text_rank": int(text_rank), "vl_rank": int(vl_rank)},
+            "current_state": {
+                "text_weight": float(current_text_weight),
+                "vl_weight": float(current_vl_weight),
+                "total_recall": int(current_total_recall),
+            },
+            "rule_hints": rule_hints,
+            "recent_memory": memory_window,
+            "constraints": {
+                "text_weight_range": [0.05, 0.95],
+                "vl_weight_sum_rule": "vl_weight = 1 - text_weight",
+                "prefer_large_divergence_band": [0.2, 0.8],
+                "total_recall_range": [max(1, int(min_total_recall)), min(500, int(max_total_recall))],
+                "max_step_weight_change": 0.18,
+                "output_keys": ["text_weight", "vl_weight", "total_recall", "summary", "reasoning"],
+            },
+        }
+        prompt = (
+            "You are Agent3, a modality routing optimizer for AdaM-Rec.\n"
+            "Goal: update text_weight, vl_weight, and total_recall for this iteration using the provided observations.\n\n"
+            "Core objective:\n"
+            "- Dynamically decide how much to rely on text-based recall vs. vision-language recall.\n"
+            "- Maximize useful differentiation between text and vl weights when confidence is high.\n"
+            "- Avoid near-equal weights unless evidence is genuinely mixed or uncertain.\n\n"
+            "Important routing principle:\n"
+            "The preferred differentiation band is [0.2, 0.8]. "
+            "When justified, push the dominant modality near >=0.8 and the weaker modality near <=0.2. "
+            "Use moderate weights such as 0.65/0.35 or 0.7/0.3 when evidence is suggestive but not decisive. "
+            "Use balanced weights only when both modalities are similarly useful or evidence is weak.\n\n"
+            "Text-dominant guidance:\n"
+            "Increase text_weight when the query or pseudo-query evidence is mainly semantic, functional, or specification-driven. "
+            "Typical text-driven signals include brand, model, compatibility, product type, function, material, size, capacity, wattage, voltage, flavor, scent, ingredient, quantity, title, version, or other explicit constraints. "
+            "If text recall ranks the target clearly better than VL recall, or VL retrieves visually similar but functionally wrong items, strongly favor text. "
+            "When these signals are strong and consistent, set text_weight >= 0.8.\n\n"
+            "VL-dominant guidance:\n"
+            "Increase vl_weight when the query or pseudo-query evidence depends mainly on visual appearance. "
+            "Typical VL-driven signals include style, color, shape, silhouette, texture, pattern, decoration, aesthetic, design, look, packaging, or visual similarity. "
+            "If VL recall ranks the target clearly better than text recall, strongly favor VL. "
+            "When these signals are strong and consistent, set vl_weight >= 0.8.\n\n"
+            "Mixed routing guidance:\n"
+            "Use moderate or balanced weights when the query combines textual constraints with visual preferences, "
+            "or when text and VL ranks are close, alternate wins, or provide complementary evidence. "
+            "Prefer mild differentiation such as 0.6/0.4 or 0.7/0.3 over exactly 0.5/0.5 when there is any clear tendency.\n\n"
+            "Observation interpretation:\n"
+            "- Lower rank is better.\n"
+            "- A modality wins strongly if it retrieves the target much higher, or retrieves it while the other misses.\n"
+            "- A modality wins weakly if the rank gap is small.\n"
+            "- Prioritize consistent trends in memory over a single noisy observation.\n"
+            "- If current evidence conflicts with memory, update conservatively unless the new evidence is very strong.\n\n"
+            "Recall-size guidance:\n"
+            "- Increase total_recall if both modalities miss, ranks are poor, or the query is broad/ambiguous.\n"
+            "- Decrease total_recall if the dominant modality retrieves targets reliably at high ranks and the query is specific.\n"
+            "- Keep total_recall stable when current evidence is mixed or the previous value seems adequate.\n"
+            "- Do not only increase recall to compensate for a bad modality; reduce that modality's weight when confidence is high.\n\n"
+            "Constraints:\n"
+            "- text_weight and vl_weight must be floats in [0.0, 1.0].\n"
+            "- text_weight + vl_weight should be 1.0.\n"
+            "- total_recall must be a positive integer.\n"
+            "- Obey any bounds provided in the input constraints, especially total_recall_range and max_step_weight_change.\n"
+            "- If evidence is sufficient and you can determine a valid update confidently, output your own LLM decision.\n"
+            "- If evidence is insufficient/uncertain or you cannot determine a reliable valid update, fall back to rule_hints "
+            "(rule_next_text_weight, rule_next_vl_weight, rule_next_total_recall) as the output baseline.\n"
+            "- Use rule_hints as guidance, but make the final decision with LLM reasoning.\n"
+            "- Output strictly one valid JSON object only, with no markdown or extra text.\n\n"
+            "JSON schema:\n"
+            "{\n"
+            '  "text_weight": float,\n'
+            '  "vl_weight": float,\n'
+            '  "total_recall": int,\n'
+            '  "summary": string,\n'
+            '  "reasoning": string\n'
+            "}\n\n"
+            "The reasoning field should briefly mention: "
+            "which modality performed better, whether the query is text-driven, VL-driven, or mixed, "
+            "how memory/rule_hints affected the update, and why total_recall changed or stayed stable.\n\n"
+            f"Input:\n{json.dumps(context_payload, ensure_ascii=False)}"
+        )
+        messages = [{"role": "user", "content": prompt}]
+        text = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
+        )
+        model_inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
+        generated_ids = self._model.generate(
+            **model_inputs,
+            max_new_tokens=min(1024, int(self.max_new_tokens)),
+        )
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
+        try:
+            index = len(output_ids) - output_ids[::-1].index(151668)
+        except ValueError:
+            index = 0
+        content = self._tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
+        payload = self._try_json_decode(content)
+        if payload is None:
+            return None
+        try:
+            text_weight = float(payload.get("text_weight", current_text_weight))
+            vl_weight = float(payload.get("vl_weight", 1.0 - text_weight))
+            total_recall = int(payload.get("total_recall", current_total_recall))
+        except Exception:
+            return None
+        text_weight = max(0.05, min(0.95, text_weight))
+        vl_weight = max(0.05, min(0.95, vl_weight))
+        weight_sum = text_weight + vl_weight
+        if weight_sum <= 1e-8:
+            text_weight, vl_weight = float(current_text_weight), float(current_vl_weight)
+        else:
+            text_weight /= weight_sum
+            vl_weight = 1.0 - text_weight
+        recall_floor = max(1, int(min_total_recall))
+        total_recall = max(recall_floor, min(min(500, int(max_total_recall)), total_recall))
+        return {
+            "text_weight": round(text_weight, 4),
+            "vl_weight": round(vl_weight, 4),
+            "total_recall": int(total_recall),
+            "summary": str(payload.get("summary", "")).strip(),
+            "reasoning": str(payload.get("reasoning", "")).strip(),
+        }
+
 
 class Qwen3QueryEmbeddingModel:
     """Query embedding wrapper for semantic history recall."""
@@ -896,8 +1042,12 @@ class RoutingRecallAgent:
         user_id: str,
         query: str,
         item_scope_ids: Optional[set[str]] = None,
+        min_total_recall: int = 50,
         max_total_recall: int = 500,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        recall_floor = max(1, int(min_total_recall))
+        recall_ceiling = max(recall_floor, min(500, int(max_total_recall)))
+
         def _safe_rank(rank: int) -> int:
             return int(rank if rank < 10**9 else 5000)
 
@@ -906,8 +1056,9 @@ class RoutingRecallAgent:
             return 1.0 / math.log2(safe + 2.0)
 
         def _estimate_total_recall(trace: List[Dict[str, Any]], hard_cap: int) -> int:
+            local_cap = max(recall_floor, min(500, int(hard_cap)))
             if not trace:
-                return int(self._clamp(hard_cap, 50, 500))
+                return int(self._clamp(local_cap, recall_floor, local_cap))
             required: List[float] = []
             for row in trace:
                 t_rank = _safe_rank(int(row.get("text_rank", 5000)))
@@ -920,7 +1071,7 @@ class RoutingRecallAgent:
                 required.append(low_rank * (1.15 + 0.35 * dominance) + 0.15 * high_rank)
             required.sort()
             pivot = required[int(0.75 * (len(required) - 1))]
-            return int(self._clamp(round(pivot), 50, min(500, hard_cap)))
+            return int(self._clamp(round(pivot), recall_floor, local_cap))
 
         def _agent_finalize_params(
             trace: List[Dict[str, Any]],
@@ -984,7 +1135,7 @@ class RoutingRecallAgent:
         text_weight = 0.5
         vl_weight = 0.5
         history_target_text = 0.5
-        total_recall = min(500, max(50, int(max_total_recall)))
+        total_recall = int(recall_ceiling)
 
         if not (query or "").strip() or self.query_embedding_model is None:
             return [], {
@@ -1039,13 +1190,13 @@ class RoutingRecallAgent:
             )
             text_rank = self._rank_of_item(text_ranked, target_item_id)
             vl_rank = self._rank_of_item(vl_ranked, target_item_id)
+            low_rank = min(_safe_rank(text_rank), _safe_rank(vl_rank))
+            gap = abs(_safe_rank(text_rank) - _safe_rank(vl_rank))
+            confidence = min(1.0, abs(math.log((_safe_rank(vl_rank) + 1) / (_safe_rank(text_rank) + 1))) / 1.6)
             text_strength = _rank_strength(text_rank)
             vl_strength = _rank_strength(vl_rank)
             strength_sum = max(1e-8, text_strength + vl_strength)
             strength_target_text = text_strength / strength_sum
-            low_rank = min(_safe_rank(text_rank), _safe_rank(vl_rank))
-            gap = abs(_safe_rank(text_rank) - _safe_rank(vl_rank))
-            confidence = min(1.0, abs(math.log((_safe_rank(vl_rank) + 1) / (_safe_rank(text_rank) + 1))) / 1.6)
             cover_share = min(0.95, max(0.5, low_rank / max(1.0, float(total_recall))))
             gap_bonus = min(0.15, math.log1p(gap) / 40.0)
             dominant_share = min(0.95, max(0.8, cover_share + gap_bonus))
@@ -1059,8 +1210,67 @@ class RoutingRecallAgent:
             history_target_text = 0.75 * history_target_text + 0.25 * step_target_text
             max_step_change = 0.05 + 0.07 * confidence
             step_delta = max(-max_step_change, min(max_step_change, history_target_text - text_weight))
-            text_weight = self._clamp(text_weight + step_delta, 0.05, 0.95)
-            vl_weight = 1.0 - text_weight
+            rule_next_text = self._clamp(text_weight + step_delta, 0.05, 0.95)
+            rule_next_vl = 1.0 - rule_next_text
+            rule_next_total_recall = _estimate_total_recall(memory + [{
+                "text_rank": text_rank,
+                "vl_rank": vl_rank,
+                "weights": {"text": round(rule_next_text, 4), "vl": round(rule_next_vl, 4)},
+            }], int(max_total_recall))
+
+            llm_update = None
+            if self.llm is not None:
+                try:
+                    llm_update = self.llm.optimize_modulation_params(
+                        query=query,
+                        step=step,
+                        target_item_id=target_item_id,
+                        pseudo_query=pq,
+                        text_rank=text_rank,
+                        vl_rank=vl_rank,
+                        current_text_weight=text_weight,
+                        current_vl_weight=vl_weight,
+                        current_total_recall=total_recall,
+                        rule_hints={
+                            "strength_target_text": round(strength_target_text, 4),
+                            "dominant_share": round(dominant_share, 4),
+                            "confidence": round(confidence, 4),
+                            "history_target_text": round(history_target_text, 4),
+                            "rule_next_text_weight": round(rule_next_text, 4),
+                            "rule_next_vl_weight": round(rule_next_vl, 4),
+                            "rule_next_total_recall": int(rule_next_total_recall),
+                        },
+                        recent_memory=memory,
+                        min_total_recall=recall_floor,
+                        max_total_recall=int(recall_ceiling),
+                    )
+                except Exception:
+                    llm_update = None
+
+            if llm_update:
+                text_weight = float(self._clamp(llm_update.get("text_weight", rule_next_text), 0.05, 0.95))
+                vl_weight = 1.0 - text_weight
+                total_recall = int(llm_update.get("total_recall", rule_next_total_recall))
+                step_summary = str(llm_update.get("summary", "")).strip() or (
+                    f"strength_target={round(strength_target_text, 3)}, "
+                    f"dominant_share={round(dominant_share, 3)}, "
+                    f"confidence={round(confidence, 3)}, "
+                    f"history_target={round(history_target_text, 3)}"
+                )
+                step_reasoning = str(llm_update.get("reasoning", "")).strip() or "llm_modulation_update"
+                update_mode = "llm_modulation_update"
+            else:
+                text_weight = float(rule_next_text)
+                vl_weight = float(rule_next_vl)
+                total_recall = int(rule_next_total_recall)
+                step_summary = (
+                    f"strength_target={round(strength_target_text, 3)}, "
+                    f"dominant_share={round(dominant_share, 3)}, "
+                    f"confidence={round(confidence, 3)}, "
+                    f"history_target={round(history_target_text, 3)}"
+                )
+                step_reasoning = "rule_fallback_update"
+                update_mode = "rule_fallback_update"
 
             memory.append(
                 {
@@ -1070,15 +1280,12 @@ class RoutingRecallAgent:
                     "text_rank": text_rank,
                     "vl_rank": vl_rank,
                     "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
-                    "summary": (
-                        f"strength_target={round(strength_target_text, 3)}, "
-                        f"dominant_share={round(dominant_share, 3)}, "
-                        f"confidence={round(confidence, 3)}, "
-                        f"history_target={round(history_target_text, 3)}"
-                    ),
+                    "summary": step_summary,
+                    "update_mode": update_mode,
+                    "reasoning": step_reasoning,
                 }
             )
-            total_recall = _estimate_total_recall(memory, int(max_total_recall))
+            total_recall = int(self._clamp(total_recall, recall_floor, recall_ceiling))
             memory[-1]["estimated_total_recall"] = int(total_recall)
 
         agent_final_params = _agent_finalize_params(memory, text_weight, vl_weight, total_recall)
@@ -1133,6 +1340,7 @@ class RoutingRecallAgent:
             "final_modal_weights": final_modal_weights,
             "final_modal_ratio": final_modal_ratio,
             "total_recall": int(min(500, total_recall)),
+            "total_recall_range": [int(recall_floor), int(recall_ceiling)],
             "agent_final_params": agent_final_params,
             "memory": memory,
             "pseudo_query_count": len(pseudo_queries),
@@ -1205,6 +1413,7 @@ class RoutingRecallAgent:
             user_id=str(user_id),
             query=clean_query,
             item_scope_ids=(scope_ids if scope_ids else None),
+            min_total_recall=max(1, int(min_candidate_items)),
             max_total_recall=min(500, int(adaptive_embedding_max_total_recall)),
         )
         if adaptive_candidates:
