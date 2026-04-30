@@ -180,25 +180,49 @@ def _rewrite_pseudo_query_with_llm(
 ) -> Dict[str, str]:
     base = f"pseudo_query_from_history: {title}; {cat_text}; {desc}".strip(" ;")
     if llm is None:
-        return {"text": base, "source": "fallback_no_llm", "error": ""}
+        return {"text": base, "source": "fallback_no_llm", "error": "", "reasoning": "llm_disabled", "raw": ""}
     prompt = (
         "You are generating a retrieval pseudo query for a history item based on user's real query.\n"
         "Goal: keep the pseudo query the same information granularity and expression style as user_query, not a product description.\n"
         f"user_query: {user_query}\n"
+        f"history_item_id: {item_id}\n"
         f"history_title: {title}\n"
         f"history_category: {cat_text}\n"
         f"history_description: {desc}\n"
-        "Output exactly one line in this format:\n"
-        "pseudo_query_from_history: <short query>\n\n"
+        "Return ONLY valid JSON (no markdown, no extra text) with this schema:\n"
+        "{\"pseudo_query\": string, \"reasoning\": string}\n"
+        "Constraints: pseudo_query should be short, natural, and query-like.\n"
     )
     try:
-        text = llm._single_line_response(prompt)
-        text = str(text or "").strip()
-        if text and "pseudo_query_from_history:" not in text:
-            return {"text": text, "source": "llm_rewrite", "error": ""}
-        return {"text": base, "source": "fallback_empty", "error": "llm_returned_empty_or_template"}
+        raw = str(llm._single_line_response(prompt) or "").strip()
+        payload = None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            if match:
+                payload = json.loads(match.group(0))
+
+        if isinstance(payload, dict):
+            pseudo_query = str(payload.get("pseudo_query", "") or "").strip()
+            reasoning = str(payload.get("reasoning", "") or "").strip()
+            if pseudo_query:
+                return {
+                    "text": pseudo_query,
+                    "source": "llm_rewrite_json",
+                    "error": "",
+                    "reasoning": reasoning,
+                    "raw": raw,
+                }
+        return {
+            "text": base,
+            "source": "fallback_invalid_json",
+            "error": "llm_output_not_valid_json_or_missing_pseudo_query",
+            "reasoning": "",
+            "raw": raw,
+        }
     except Exception as exc:
-        return {"text": base, "source": "fallback_exception", "error": str(exc)}
+        return {"text": base, "source": "fallback_exception", "error": str(exc), "reasoning": "", "raw": ""}
 
 
 def _lightweight_profile(meta: Dict[str, Any], item_id: str) -> Dict[str, Any]:
@@ -714,6 +738,8 @@ def _adaptive_embedding_fusion(
         pseudo_query_meta[iid] = {
             "source": str(rewrite.get("source", "")),
             "error": str(rewrite.get("error", "")),
+            "reasoning": str(rewrite.get("reasoning", "")),
+            "raw": str(rewrite.get("raw", "")),
         }
 
     for step, iid in enumerate(pseudo_targets, start=1):
