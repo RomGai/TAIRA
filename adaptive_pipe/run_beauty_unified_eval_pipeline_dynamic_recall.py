@@ -180,25 +180,36 @@ def _rewrite_pseudo_query_with_llm(
 ) -> Dict[str, str]:
     base = f"pseudo_query_from_history: {title}; {cat_text}; {desc}".strip(" ;")
     if llm is None:
-        return {"text": base, "source": "fallback_no_llm", "error": ""}
+        return {"text": base, "source": "fallback_no_llm", "error": "", "reasoning": "llm_disabled", "raw": ""}
     prompt = (
         "You are generating a retrieval pseudo query for a history item based on user's real query.\n"
         "Goal: keep the pseudo query the same information granularity and expression style as user_query, not a product description.\n"
         f"user_query: {user_query}\n"
+        f"history_item_id: {item_id}\n"
         f"history_title: {title}\n"
         f"history_category: {cat_text}\n"
         f"history_description: {desc}\n"
-        "Output exactly one line in this format:\n"
-        "pseudo_query_from_history: <short query>\n\n"
+        "Output one short pseudo query only.\n"
     )
     try:
-        text = llm._single_line_response(prompt)
-        text = str(text or "").strip()
-        if text and "pseudo_query_from_history:" not in text:
-            return {"text": text, "source": "llm_rewrite", "error": ""}
-        return {"text": base, "source": "fallback_empty", "error": "llm_returned_empty_or_template"}
+        raw = str(
+            llm.rewrite_pseudo_query(
+                real_query=user_query,
+                history_item_info={
+                    "item_id": item_id,
+                    "title": title,
+                    "category": cat_text,
+                    "description": desc,
+                    "instruction": prompt,
+                },
+            )
+            or ""
+        ).strip()
+        if raw:
+            return {"text": raw, "source": "llm_rewrite_text", "error": "", "reasoning": "", "raw": raw}
+        return {"text": base, "source": "fallback_empty", "error": "llm_returned_empty_text", "reasoning": "", "raw": raw}
     except Exception as exc:
-        return {"text": base, "source": "fallback_exception", "error": str(exc)}
+        return {"text": base, "source": "fallback_exception", "error": str(exc), "reasoning": "", "raw": ""}
 
 
 def _lightweight_profile(meta: Dict[str, Any], item_id: str) -> Dict[str, Any]:
@@ -714,6 +725,8 @@ def _adaptive_embedding_fusion(
         pseudo_query_meta[iid] = {
             "source": str(rewrite.get("source", "")),
             "error": str(rewrite.get("error", "")),
+            "reasoning": str(rewrite.get("reasoning", "")),
+            "raw": str(rewrite.get("raw", "")),
         }
 
     for step, iid in enumerate(pseudo_targets, start=1):
