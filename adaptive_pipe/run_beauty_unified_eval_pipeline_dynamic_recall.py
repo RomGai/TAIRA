@@ -178,6 +178,17 @@ def _rewrite_pseudo_query_with_llm(
     desc: str,
     cat_text: str,
 ) -> Dict[str, str]:
+    def _clean_pseudo_query_text(text: str) -> str:
+        t = str(text or "").strip()
+        if not t:
+            return ""
+        # Remove common reasoning wrappers/tags that may leak from some chat templates.
+        t = re.sub(r"<\s*/?\s*think\s*>", " ", t, flags=re.IGNORECASE)
+        t = re.sub(r"<\s*think\s*>.*?<\s*/\s*think\s*>", " ", t, flags=re.IGNORECASE | re.DOTALL)
+        t = re.sub(r"^\s*thinking\s*:\s*", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\s+", " ", t).strip(" \t\r\n\"'`")
+        return t
+
     base = f"pseudo_query_from_history: {title}; {cat_text}; {desc}".strip(" ;")
     if llm is None:
         return {"text": base, "source": "fallback_no_llm", "error": "", "reasoning": "llm_disabled", "raw": ""}
@@ -236,9 +247,16 @@ def _rewrite_pseudo_query_with_llm(
             )
             or ""
         ).strip()
-        if raw:
-            return {"text": raw, "source": "llm_rewrite_text", "error": "", "reasoning": "", "raw": raw}
-        return {"text": base, "source": "fallback_empty", "error": "llm_returned_empty_text", "reasoning": "", "raw": raw}
+        cleaned = _clean_pseudo_query_text(raw)
+        if cleaned:
+            return {"text": cleaned, "source": "llm_rewrite_text", "error": "", "reasoning": "", "raw": raw}
+        return {
+            "text": base,
+            "source": "fallback_empty",
+            "error": "llm_returned_empty_or_think_only_text",
+            "reasoning": "",
+            "raw": raw,
+        }
     except Exception as exc:
         return {"text": base, "source": "fallback_exception", "error": str(exc), "reasoning": "", "raw": ""}
 
@@ -718,7 +736,13 @@ def _adaptive_embedding_fusion(
     total_k = int(max(min_recall, min(max_available, max_recall)))
     memory: List[Dict[str, Any]] = []
     recall_llm = Qwen3RouterLLM(model_name=llm_model_name) if enable_llm_recall_control else None
-    pseudo_rewrite_llm = Qwen3RouterLLM(model_name=llm_model_name) if enable_llm_pseudo_query_rewrite else None
+    # Disable thinking mode for pseudo-query rewrite to avoid exposing reasoning tags
+    # (e.g. "<think>") in the one-line retrieval query output.
+    pseudo_rewrite_llm = (
+        Qwen3RouterLLM(model_name=llm_model_name, enable_thinking=False)
+        if enable_llm_pseudo_query_rewrite
+        else None
+    )
 
     if qwen3vl_rank_indices is None:
         top_ids = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:total_k]]
