@@ -655,6 +655,15 @@ def _adaptive_embedding_fusion(
         if iid in meta_map:
             history_candidates.append(iid)
     pseudo_targets = history_candidates[: max(1, int(max_pseudo_queries))]
+    pseudo_query_map: Dict[str, str] = {}
+    for iid in pseudo_targets:
+        meta = meta_map.get(iid, {})
+        title = str(meta.get("title", "") or "").strip()
+        desc = str(meta.get("description", "") or "").strip()
+        cats = _meta_category_paths(meta)
+        cat_text = " > ".join(cats[0]) if cats else ""
+        pseudo_query_map[iid] = f"pseudo_query_from_history: {title}; {cat_text}; {desc}".strip(" ;")
+
     for step, iid in enumerate(pseudo_targets, start=1):
         prev_text_weight = text_weight
         prev_vl_weight = vl_weight
@@ -666,6 +675,7 @@ def _adaptive_embedding_fusion(
                 {
                     "step": step,
                     "target_item_id": iid,
+                    "pseudo_query": pseudo_query_map.get(iid, ""),
                     "text_rank": None,
                     "vl_rank": None,
                     "rank_available": False,
@@ -703,6 +713,7 @@ def _adaptive_embedding_fusion(
             {
                 "step": step,
                 "target_item_id": iid,
+                "pseudo_query": pseudo_query_map.get(iid, ""),
                 "text_rank": int(text_rank),
                 "vl_rank": int(vl_rank),
                 "rank_available": True,
@@ -743,6 +754,10 @@ def _adaptive_embedding_fusion(
             sum(1 for iid in pseudo_targets if iid in text_rank_map or iid in vl_rank_map)
         ),
         "pseudo_query_count": len(pseudo_targets),
+        "pseudo_queries": [
+            {"item_id": iid, "pseudo_query": pseudo_query_map.get(iid, "")}
+            for iid in pseudo_targets
+        ],
         "memory": memory,
     }
 
@@ -1224,7 +1239,24 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "recall_size": int(kw_debug.get("merged_pool_size", len(top_ids))),
                 "source": "pool_ratio",
             }
+        adaptive_state_payload = adaptive_state if isinstance(adaptive_state, dict) else {}
+        adaptive_memory = adaptive_state_payload.get("memory", []) if isinstance(adaptive_state_payload, dict) else []
+        adaptive_history_titles = [
+            {
+                "item_id": hid,
+                "title": str((meta_map.get(hid) or {}).get("title", "") or ""),
+            }
+            for hid in history_ids
+            if hid in meta_map
+        ]
+        modal_modulation_process = {
+            "final_params": modal_params,
+            "history_items": adaptive_history_titles,
+            "adaptive_state": adaptive_state_payload,
+            "adaptive_steps": adaptive_memory,
+        }
         kw_debug["modal_modulation_params"] = modal_params
+        kw_debug["modal_modulation_process"] = modal_modulation_process
         _append_jsonl(
             modal_trace_path,
             {
@@ -1232,7 +1264,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "target_id": target_id,
                 "query": query,
                 "modal_modulation_params": modal_params,
-                "adaptive_embedding_state": adaptive_state if isinstance(adaptive_state, dict) else {},
+                "modal_modulation_process": modal_modulation_process,
             },
         )
         print(
@@ -1314,6 +1346,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "routing": routed,
             "candidate_items": candidate_items,
             "query_relevant_history": history_rows,
+            "modal_modulation_process": kw_debug.get("modal_modulation_process", {}),
         }
 
         ranked_first = ""
