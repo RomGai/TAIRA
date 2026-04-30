@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -231,8 +232,24 @@ class Qwen3RouterLLM:
         content = self._tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n").strip()
         if not content:
             return ""
-        first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), content).strip()
-        return first_line.strip("\"'` ")
+
+        # Robustly strip leaked thinking tags/chunks and pick a meaningful query line.
+        cleaned = re.sub(r"<\s*think\s*>.*?<\s*/\s*think\s*>", " ", content, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<\s*/?\s*think\s*>", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("</think>", " ").replace("<think>", " ")
+
+        candidate_lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+        kept_lines: List[str] = []
+        for line in candidate_lines:
+            lowered = line.lower()
+            if lowered in {"<think>", "</think>", "think", "thinking"}:
+                continue
+            normalized = re.sub(r"\s+", " ", line).strip("\"'` ")
+            if normalized:
+                kept_lines.append(normalized)
+        if not kept_lines:
+            return ""
+        return " ".join(kept_lines).strip()
 
     def optimize_modulation_params(
         self,
