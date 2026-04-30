@@ -189,9 +189,7 @@ def _rewrite_pseudo_query_with_llm(
         f"history_title: {title}\n"
         f"history_category: {cat_text}\n"
         f"history_description: {desc}\n"
-        "Return ONLY valid JSON (no markdown, no extra text) with this schema:\n"
-        "{\"pseudo_query\": string, \"reasoning\": string}\n"
-        "Constraints: pseudo_query should be short, natural, and query-like.\n"
+        "Output one short pseudo query only.\n"
     )
 
     def _parse_json_like_agent4(text: str) -> Dict[str, Any] | None:
@@ -238,48 +236,9 @@ def _rewrite_pseudo_query_with_llm(
             )
             or ""
         ).strip()
-        payload = _parse_json_like_agent4(raw)
-        if payload is None:
-            strict_prompt = (
-                prompt
-                + "\nIMPORTANT: Output exactly one valid JSON object only. "
-                + "Do not include markdown/code fences/comments/trailing text."
-            )
-            strict_raw = str(
-                llm.rewrite_pseudo_query(
-                    real_query=user_query,
-                    history_item_info={
-                        "item_id": item_id,
-                        "title": title,
-                        "category": cat_text,
-                        "description": desc,
-                        "instruction": strict_prompt,
-                    },
-                )
-                or ""
-            ).strip()
-            if strict_raw:
-                raw = strict_raw
-                payload = _parse_json_like_agent4(raw)
-
-        if isinstance(payload, dict):
-            pseudo_query = str(payload.get("pseudo_query", "") or "").strip()
-            reasoning = str(payload.get("reasoning", "") or "").strip()
-            if pseudo_query:
-                return {
-                    "text": pseudo_query,
-                    "source": "llm_rewrite_json",
-                    "error": "",
-                    "reasoning": reasoning,
-                    "raw": raw,
-                }
-        return {
-            "text": base,
-            "source": "fallback_invalid_json",
-            "error": "llm_output_not_valid_json_or_missing_pseudo_query",
-            "reasoning": "",
-            "raw": raw,
-        }
+        if raw:
+            return {"text": raw, "source": "llm_rewrite_text", "error": "", "reasoning": "", "raw": raw}
+        return {"text": base, "source": "fallback_empty", "error": "llm_returned_empty_text", "reasoning": "", "raw": raw}
     except Exception as exc:
         return {"text": base, "source": "fallback_exception", "error": str(exc), "reasoning": "", "raw": ""}
 
