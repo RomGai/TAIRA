@@ -182,17 +182,14 @@ def _rewrite_pseudo_query_with_llm(
     if llm is None:
         return {"text": base, "source": "fallback_no_llm", "error": ""}
     prompt = (
-        "You are rewriting a retrieval pseudo query from user intent + history item.\n"
-        "Goal: keep the same information granularity as user_query, not a product description.\n"
-        "Must preserve explicit constraints from user_query whenever possible: brand, product type, size/volume, certification, ingredient/process, usage scene.\n"
-        "If history item conflicts with user_query, prioritize user_query and keep only overlap signals from history.\n"
-        "Output exactly one short query line, <= 24 words, no explanation.\n\n"
+        "You are generating a retrieval pseudo query for a history item based on user's real query.\n"
+        "Goal: keep the pseudo query the same information granularity and expression style as user_query, not a product description.\n"
         f"user_query: {user_query}\n"
-        f"history_item_id: {item_id}\n"
         f"history_title: {title}\n"
         f"history_category: {cat_text}\n"
         f"history_description: {desc}\n"
-        "output_query:"
+        "Output exactly one line in this format:\n"
+        "pseudo_query_from_history: <short query>\n\n"
     )
     try:
         text = llm._single_line_response(prompt)
