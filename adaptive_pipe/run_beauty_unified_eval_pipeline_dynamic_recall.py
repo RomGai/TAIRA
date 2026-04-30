@@ -177,26 +177,32 @@ def _rewrite_pseudo_query_with_llm(
     title: str,
     desc: str,
     cat_text: str,
-) -> str:
+) -> Dict[str, str]:
     base = f"pseudo_query_from_history: {title}; {cat_text}; {desc}".strip(" ;")
     if llm is None:
-        return base
+        return {"text": base, "source": "fallback_no_llm", "error": ""}
     prompt = (
-        "Rewrite one concise pseudo query for retrieval based on a history item and current user need. "
-        "Keep only product intent keywords, avoid long sentences, output one line only.\n"
+        "You are rewriting a retrieval pseudo query from user intent + history item.\n"
+        "Goal: keep the same information granularity as user_query, not a product description.\n"
+        "Must preserve explicit constraints from user_query whenever possible: brand, product type, size/volume, certification, ingredient/process, usage scene.\n"
+        "If history item conflicts with user_query, prioritize user_query and keep only overlap signals from history.\n"
+        "Output exactly one short query line, <= 24 words, no explanation.\n\n"
         f"user_query: {user_query}\n"
         f"history_item_id: {item_id}\n"
         f"history_title: {title}\n"
         f"history_category: {cat_text}\n"
         f"history_description: {desc}\n"
-        "Output:"
+        "output_query:"
     )
     try:
         text = llm._single_line_response(prompt)
         text = str(text or "").strip()
-        return text if text else base
-    except Exception:
-        return base
+        if text and "pseudo_query_from_history:" not in text:
+            return {"text": text, "source": "llm_rewrite", "error": ""}
+        return {"text": base, "source": "fallback_empty", "error": "llm_returned_empty_or_template"}
+    except Exception as exc:
+        return {"text": base, "source": "fallback_exception", "error": str(exc)}
+
 
 def _lightweight_profile(meta: Dict[str, Any], item_id: str) -> Dict[str, Any]:
     category_paths = _meta_category_paths(meta)
@@ -692,13 +698,14 @@ def _adaptive_embedding_fusion(
             history_candidates.append(iid)
     pseudo_targets = history_candidates[: max(1, int(max_pseudo_queries))]
     pseudo_query_map: Dict[str, str] = {}
+    pseudo_query_meta: Dict[str, Dict[str, str]] = {}
     for iid in pseudo_targets:
         meta = meta_map.get(iid, {})
         title = str(meta.get("title", "") or "").strip()
         desc = str(meta.get("description", "") or "").strip()
         cats = _meta_category_paths(meta)
         cat_text = " > ".join(cats[0]) if cats else ""
-        pseudo_query_map[iid] = _rewrite_pseudo_query_with_llm(
+        rewrite = _rewrite_pseudo_query_with_llm(
             llm=pseudo_rewrite_llm,
             user_query=user_query,
             item_id=iid,
@@ -706,6 +713,11 @@ def _adaptive_embedding_fusion(
             desc=desc,
             cat_text=cat_text,
         )
+        pseudo_query_map[iid] = str(rewrite.get("text", "") or "")
+        pseudo_query_meta[iid] = {
+            "source": str(rewrite.get("source", "")),
+            "error": str(rewrite.get("error", "")),
+        }
 
     for step, iid in enumerate(pseudo_targets, start=1):
         prev_text_weight = text_weight
@@ -719,6 +731,7 @@ def _adaptive_embedding_fusion(
                     "step": step,
                     "target_item_id": iid,
                     "pseudo_query": pseudo_query_map.get(iid, ""),
+                    "pseudo_query_rewrite_meta": pseudo_query_meta.get(iid, {}),
                     "text_rank": None,
                     "vl_rank": None,
                     "rank_available": False,
@@ -831,7 +844,7 @@ def _adaptive_embedding_fusion(
         ),
         "pseudo_query_count": len(pseudo_targets),
         "pseudo_queries": [
-            {"item_id": iid, "pseudo_query": pseudo_query_map.get(iid, "")}
+            {"item_id": iid, "pseudo_query": pseudo_query_map.get(iid, ""), "rewrite_meta": pseudo_query_meta.get(iid, {})}
             for iid in pseudo_targets
         ],
         "memory": memory,
