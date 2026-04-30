@@ -194,7 +194,19 @@ def _rewrite_pseudo_query_with_llm(
         "Constraints: pseudo_query should be short, natural, and query-like.\n"
     )
     try:
-        raw = str(llm._single_line_response(prompt) or "").strip()
+        raw = str(
+            llm.rewrite_pseudo_query(
+                real_query=user_query,
+                history_item_info={
+                    "item_id": item_id,
+                    "title": title,
+                    "category": cat_text,
+                    "description": desc,
+                    "instruction": prompt,
+                },
+            )
+            or ""
+        ).strip()
         payload = None
         try:
             payload = json.loads(raw)
@@ -214,6 +226,14 @@ def _rewrite_pseudo_query_with_llm(
                     "reasoning": reasoning,
                     "raw": raw,
                 }
+        if raw:
+            return {
+                "text": raw,
+                "source": "llm_rewrite_text",
+                "error": "",
+                "reasoning": "router_llm_returns_plain_query_text",
+                "raw": raw,
+            }
         return {
             "text": base,
             "source": "fallback_invalid_json",
