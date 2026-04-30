@@ -191,6 +191,37 @@ def _rewrite_pseudo_query_with_llm(
         f"history_description: {desc}\n"
         "Output one short pseudo query only.\n"
     )
+
+    def _parse_json_like_agent4(text: str) -> Dict[str, Any] | None:
+        decoder = json.JSONDecoder()
+        stripped = str(text or "").strip()
+        try:
+            payload = json.loads(stripped)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            pass
+        if "```" in stripped:
+            for part in stripped.split("```"):
+                candidate = part.replace("json", "", 1).strip()
+                if not candidate:
+                    continue
+                try:
+                    payload = json.loads(candidate)
+                    if isinstance(payload, dict):
+                        return payload
+                except json.JSONDecodeError:
+                    continue
+        for i, ch in enumerate(stripped):
+            if ch != "{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(stripped, i)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return None
     try:
         raw = str(
             llm.rewrite_pseudo_query(
