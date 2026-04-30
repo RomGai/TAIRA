@@ -193,6 +193,37 @@ def _rewrite_pseudo_query_with_llm(
         "{\"pseudo_query\": string, \"reasoning\": string}\n"
         "Constraints: pseudo_query should be short, natural, and query-like.\n"
     )
+
+    def _parse_json_like_agent4(text: str) -> Dict[str, Any] | None:
+        decoder = json.JSONDecoder()
+        stripped = str(text or "").strip()
+        try:
+            payload = json.loads(stripped)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            pass
+        if "```" in stripped:
+            for part in stripped.split("```"):
+                candidate = part.replace("json", "", 1).strip()
+                if not candidate:
+                    continue
+                try:
+                    payload = json.loads(candidate)
+                    if isinstance(payload, dict):
+                        return payload
+                except json.JSONDecodeError:
+                    continue
+        for i, ch in enumerate(stripped):
+            if ch != "{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(stripped, i)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return None
     try:
         raw = str(
             llm.rewrite_pseudo_query(
@@ -207,13 +238,29 @@ def _rewrite_pseudo_query_with_llm(
             )
             or ""
         ).strip()
-        payload = None
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-            if match:
-                payload = json.loads(match.group(0))
+        payload = _parse_json_like_agent4(raw)
+        if payload is None:
+            strict_prompt = (
+                prompt
+                + "\nIMPORTANT: Output exactly one valid JSON object only. "
+                + "Do not include markdown/code fences/comments/trailing text."
+            )
+            strict_raw = str(
+                llm.rewrite_pseudo_query(
+                    real_query=user_query,
+                    history_item_info={
+                        "item_id": item_id,
+                        "title": title,
+                        "category": cat_text,
+                        "description": desc,
+                        "instruction": strict_prompt,
+                    },
+                )
+                or ""
+            ).strip()
+            if strict_raw:
+                raw = strict_raw
+                payload = _parse_json_like_agent4(raw)
 
         if isinstance(payload, dict):
             pseudo_query = str(payload.get("pseudo_query", "") or "").strip()
@@ -226,14 +273,6 @@ def _rewrite_pseudo_query_with_llm(
                     "reasoning": reasoning,
                     "raw": raw,
                 }
-        if raw:
-            return {
-                "text": raw,
-                "source": "llm_rewrite_text",
-                "error": "",
-                "reasoning": "router_llm_returns_plain_query_text",
-                "raw": raw,
-            }
         return {
             "text": base,
             "source": "fallback_invalid_json",
