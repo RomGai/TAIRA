@@ -578,9 +578,10 @@ def _adaptive_embedding_fusion(
         return 1.0 / math.log2(safe + 2.0)
 
     def _estimate_total_k(history: List[Dict[str, Any]], hard_cap: int) -> int:
+        """Estimate recall size from per-step best modality rank (min(text_rank, vl_rank))."""
         if not history:
             return int(max(min_recall, min(max_available, hard_cap)))
-        required: List[float] = []
+        min_rank_trace: List[int] = []
         for row in history:
             if not bool(row.get("rank_available", True)):
                 continue
@@ -590,17 +591,15 @@ def _adaptive_embedding_fusion(
                 continue
             t_rank = _safe_rank(int(t_raw)) if t_raw is not None else 5000
             v_rank = _safe_rank(int(v_raw)) if v_raw is not None else 5000
-            t_w = float(row.get("weights", {}).get("text", 0.5))
-            v_w = float(row.get("weights", {}).get("vl", 0.5))
-            low_rank = min(t_rank, v_rank)
-            high_rank = max(t_rank, v_rank)
-            dominance = abs(t_w - v_w)
-            required.append(low_rank * (1.15 + 0.35 * dominance) + 0.15 * high_rank)
-        if not required:
+            min_rank_trace.append(int(min(t_rank, v_rank)))
+        if not min_rank_trace:
             return int(max(min_recall, min(max_available, hard_cap)))
-        required.sort()
-        pivot = required[int(0.75 * (len(required) - 1))]
-        return int(max(min_recall, min(max_available, min(hard_cap, round(pivot)))))
+        min_rank_trace.sort()
+        # robust pivot on min-rank, then reserve modest headroom for neighboring candidates
+        p80 = min_rank_trace[int(0.8 * (len(min_rank_trace) - 1))]
+        headroom = max(20, int(round(p80 * 0.2)))
+        proposed = int(p80 + headroom)
+        return int(max(min_recall, min(max_available, min(hard_cap, proposed))))
 
     def _agent_finalize_params(
         history: List[Dict[str, Any]],
@@ -768,7 +767,7 @@ def _adaptive_embedding_fusion(
                     f"dominant_share={round(dominant_share, 3)}, "
                     f"confidence={round(confidence, 3)}, "
                     f"history_target={round(history_target_text, 3)}, "
-                    f"total_recall_range=[{min_recall},{max_recall}], "
+                    f"total_recall_range=[{min_recall},{max_recall}], est_basis=min(text_rank,vl_rank), "
                     "use history-smoothed extreme allocation (>=8:2 when modality differs)"
                 ),
             }
