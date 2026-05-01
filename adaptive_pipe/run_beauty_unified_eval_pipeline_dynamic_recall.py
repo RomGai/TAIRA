@@ -6,6 +6,7 @@ import glob
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -1356,6 +1357,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 x.strip() for x in str(row.get("remaining_interaction_string", "")).split("|") if x.strip()
             )
         )
+        adaptive_to_downstream_start_ts = time.perf_counter()
         if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
             adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
                 history_ids=history_ids,
@@ -1444,6 +1446,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             continue
 
         print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
+        adaptive_to_downstream_pre_agent12_ts = time.perf_counter()
         candidate_items: List[Dict[str, Any]] = []
         for i, iid in enumerate(top_ids, start=1):
             meta = meta_map[iid]
@@ -1497,6 +1500,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             history_rows.append({"user_id": user_id, "item_id": iid, "behavior": "positive", "timestamp": None, "profile": profile})
             if i % 20 == 0 or i == len(history_ids):
                 print(f"[Agent2] {i}/{len(history_ids)}")
+        adaptive_to_downstream_post_agent12_ts = time.perf_counter()
 
         agent3_output = {
             "query": q_sentence,
@@ -1526,6 +1530,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             ranked_first = module3_out.ranked_items[0]["item_id"] if module3_out.ranked_items else ""
         else:
             print("[Agent4/5] skipped by --disable-agent45")
+        adaptive_to_downstream_end_ts = time.perf_counter()
+        adaptive_to_downstream_elapsed_sec = (
+            (adaptive_to_downstream_pre_agent12_ts - adaptive_to_downstream_start_ts)
+            + (adaptive_to_downstream_end_ts - adaptive_to_downstream_post_agent12_ts)
+        )
+        kw_debug["adaptive_to_recall_ranking_elapsed_sec"] = round(adaptive_to_downstream_elapsed_sec, 4)
+        print(
+            "[Timing] adaptive-routing + downstream(recall/ranking, excl Agent1/2) "
+            f"elapsed={kw_debug['adaptive_to_recall_ranking_elapsed_sec']}s"
+        )
 
         results.append({
             "user_id": user_id,
