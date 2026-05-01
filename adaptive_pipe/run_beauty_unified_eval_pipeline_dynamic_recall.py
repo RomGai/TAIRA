@@ -1447,6 +1447,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             continue
 
         print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
+        adaptive_to_downstream_pre_agent12_ts = time.perf_counter()
         candidate_items: List[Dict[str, Any]] = []
         for i, iid in enumerate(top_ids, start=1):
             meta = meta_map[iid]
