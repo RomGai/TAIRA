@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,7 @@ class Module3Output:
     preference_constraints: Dict[str, Any]
     ranked_items: List[Dict[str, Any]]
     groundtruth_target_item_id: str = ""
+    timing: Dict[str, Any] | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -636,6 +638,7 @@ def run_module3(
         constraints.must_have = []
 
     ranker = RankingScoringAgent(reranker=LLMItemReranker(model_name=model_name))
+    reranker_start_ts = time.perf_counter()
     ranked_items = ranker.run(
         query=query,
         preference_constraints=constraints,
@@ -643,6 +646,7 @@ def run_module3(
         top_n=top_n,
         disable_prediction_bonus=disable_prediction_bonus,
     )
+    reranker_elapsed_sec = time.perf_counter() - reranker_start_ts
 
     output = Module3Output(
         user_id=user_id,
@@ -650,6 +654,7 @@ def run_module3(
         preference_constraints=constraints.to_dict(),
         ranked_items=ranked_items,
         groundtruth_target_item_id=str(groundtruth_target_item_id or ""),
+        timing={"reranker_elapsed_sec": round(reranker_elapsed_sec, 4)},
     )
 
     if save_output:

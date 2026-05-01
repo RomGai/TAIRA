@@ -1511,7 +1511,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         }
 
         ranked_first = ""
-        reranker_start_ts = time.perf_counter()
+        reranker_elapsed_sec = 0.0
         if args.enable_agent45:
             module3_out = run_module3(
                 intent_dual_recall_output=agent3_output,
@@ -1528,11 +1528,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 collaborative_max_items=int(args.collaborative_max_items),
             )
             ranked_first = module3_out.ranked_items[0]["item_id"] if module3_out.ranked_items else ""
+            module3_timing = getattr(module3_out, "timing", None)
+            if isinstance(module3_timing, dict):
+                reranker_elapsed_sec = float(module3_timing.get("reranker_elapsed_sec", 0.0) or 0.0)
         else:
             print("[Agent4/5] skipped by --disable-agent45")
-        reranker_end_ts = time.perf_counter()
         adaptive_pseudo_opt_elapsed_sec = adaptive_pseudo_opt_end_ts - adaptive_pseudo_opt_start_ts
-        reranker_elapsed_sec = (reranker_end_ts - reranker_start_ts) if args.enable_agent45 else 0.0
         adaptive_to_recall_ranking_elapsed_sec = adaptive_pseudo_opt_elapsed_sec + reranker_elapsed_sec
         kw_debug["adaptive_pseudo_opt_elapsed_sec"] = round(adaptive_pseudo_opt_elapsed_sec, 4)
         kw_debug["reranker_elapsed_sec"] = round(reranker_elapsed_sec, 4)
