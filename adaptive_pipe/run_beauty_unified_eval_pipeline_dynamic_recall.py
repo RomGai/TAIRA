@@ -6,6 +6,7 @@ import glob
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -1356,6 +1357,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 x.strip() for x in str(row.get("remaining_interaction_string", "")).split("|") if x.strip()
             )
         )
+        adaptive_pseudo_opt_start_ts = time.perf_counter()
         if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
             adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
                 history_ids=history_ids,
@@ -1374,6 +1376,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             top_ids = _merge_unique_ids(top_ids, adaptive_ids)
             used_k = len(top_ids)
             kw_debug["adaptive_embedding_state"] = adaptive_state
+        adaptive_pseudo_opt_end_ts = time.perf_counter()
         adaptive_state = kw_debug.get("adaptive_embedding_state", {}) if isinstance(kw_debug, dict) else {}
         if isinstance(adaptive_state, dict) and adaptive_state.get("enabled"):
             agent_final_params = adaptive_state.get("agent_final_params", {})
@@ -1497,7 +1500,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             history_rows.append({"user_id": user_id, "item_id": iid, "behavior": "positive", "timestamp": None, "profile": profile})
             if i % 20 == 0 or i == len(history_ids):
                 print(f"[Agent2] {i}/{len(history_ids)}")
-
         agent3_output = {
             "query": q_sentence,
             "user_id": user_id,
@@ -1508,6 +1510,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         }
 
         ranked_first = ""
+        reranker_elapsed_sec = 0.0
         if args.enable_agent45:
             module3_out = run_module3(
                 intent_dual_recall_output=agent3_output,
@@ -1524,8 +1527,22 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 collaborative_max_items=int(args.collaborative_max_items),
             )
             ranked_first = module3_out.ranked_items[0]["item_id"] if module3_out.ranked_items else ""
+            module3_timing = getattr(module3_out, "timing", None)
+            if isinstance(module3_timing, dict):
+                reranker_elapsed_sec = float(module3_timing.get("reranker_elapsed_sec", 0.0) or 0.0)
         else:
             print("[Agent4/5] skipped by --disable-agent45")
+        adaptive_pseudo_opt_elapsed_sec = adaptive_pseudo_opt_end_ts - adaptive_pseudo_opt_start_ts
+        adaptive_to_recall_ranking_elapsed_sec = adaptive_pseudo_opt_elapsed_sec + reranker_elapsed_sec
+        kw_debug["adaptive_pseudo_opt_elapsed_sec"] = round(adaptive_pseudo_opt_elapsed_sec, 4)
+        kw_debug["reranker_elapsed_sec"] = round(reranker_elapsed_sec, 4)
+        kw_debug["adaptive_to_recall_ranking_elapsed_sec"] = round(adaptive_to_recall_ranking_elapsed_sec, 4)
+        print(
+            "[Timing] pseudo+opt + reranker only "
+            f"pseudo_opt={kw_debug['adaptive_pseudo_opt_elapsed_sec']}s "
+            f"reranker={kw_debug['reranker_elapsed_sec']}s "
+            f"total={kw_debug['adaptive_to_recall_ranking_elapsed_sec']}s"
+        )
 
         results.append({
             "user_id": user_id,
