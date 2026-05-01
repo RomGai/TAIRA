@@ -4,6 +4,7 @@ import json
 import logging
 import math
 from datetime import datetime
+from time import perf_counter
 from pathlib import Path
 
 import pandas as pd
@@ -358,6 +359,7 @@ def process_queries(
     ]
 
     for index, row in df.iterrows():
+        query_start_time = perf_counter()
         log_file = log_dir / f'log_{index + 1}.log'
         logger = setup_logger(str(log_file))
         print(f'Processing query {index + 1}')
@@ -404,6 +406,11 @@ def process_queries(
                 row[metric_key] = 0
             row['fail'] = 1
             row['pattern_used'] = 'error'
+
+        query_elapsed_seconds = perf_counter() - query_start_time
+        row['query_time_seconds'] = query_elapsed_seconds
+        print(f'Query {index + 1} finished in {query_elapsed_seconds:.4f} seconds')
+        logger.info('Query %s finished in %.4f seconds', index + 1, query_elapsed_seconds)
 
         row_df = pd.DataFrame([row])
         if not results_csv.exists():
