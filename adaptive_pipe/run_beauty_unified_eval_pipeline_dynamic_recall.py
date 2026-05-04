@@ -197,6 +197,59 @@ def _export_top_ranked_bundle(
     _save_json(bundle_dir / "top_items_with_meta.json", export_payload)
 
 
+def _export_branch_recall_bundle(
+    *,
+    query: str,
+    user_id: str,
+    branch_name: str,
+    ranked_item_ids: List[str],
+    meta_map: Dict[str, Dict[str, Any]],
+    image_url_to_local: Dict[str, str],
+    export_root_dir: Path,
+    top_k: int = 50,
+) -> None:
+    branch_dir = export_root_dir / _sanitize_filename(str(user_id)) / _sanitize_filename(branch_name)
+    images_dir = branch_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    payload_items: List[Dict[str, Any]] = []
+    for rank_idx, iid in enumerate(ranked_item_ids[: max(1, int(top_k))], start=1):
+        item_id = str(iid or "").strip()
+        if not item_id:
+            continue
+        meta = dict(meta_map.get(item_id, {}))
+        image_src = ""
+        copied_image_path = ""
+        if meta:
+            image_url = _safe_meta_image(meta)
+            image_src = image_url_to_local.get(image_url, "")
+            if image_src and Path(image_src).exists():
+                suffix = Path(image_src).suffix or ".jpg"
+                dst = images_dir / f"{rank_idx:03d}_{_sanitize_filename(item_id)}{suffix}"
+                try:
+                    shutil.copy2(image_src, dst)
+                    copied_image_path = str(dst)
+                except Exception as exc:
+                    print(f"[BranchExport] copy image failed branch={branch_name} rank={rank_idx} item={item_id} err={exc}")
+        payload_items.append(
+            {
+                "rank": rank_idx,
+                "item_id": item_id,
+                "copied_image_path": copied_image_path,
+                "meta": meta,
+            }
+        )
+    _save_json(
+        branch_dir / "top_items_with_meta.json",
+        {
+            "query": query,
+            "user_id": user_id,
+            "branch": branch_name,
+            "top_k": int(top_k),
+            "items": payload_items,
+        },
+    )
+
+
 def _route_query(query: str, category_catalog: List[str], enable_llm: bool, text_model: str) -> Dict[str, Any]:
     if not enable_llm:
         return {
@@ -1333,6 +1386,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         rank_indices = np.argsort(-sim_matrix)
         full_sim_matrix = np.matmul(item_emb_norm, q_emb_norm[0])
         full_rank_indices = np.argsort(-full_sim_matrix)
+        text_branch_top_ids = [filtered_item_ids[int(idx)] for idx in rank_indices[: max(1, int(args.export_recall_branch_topk))]]
 
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
         hybrid_embedding_topk = (
@@ -1350,6 +1404,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         )
         qwen3vl_rank_indices = None
         qwen3vl_rank_indices_all = None
+        qwen3vl_branch_top_ids: List[str] = []
         if args.enable_agent3_qwen3vl_embedding and qwen3vl_model is not None and qwen3vl_item_emb_norm is not None:
             qwen3vl_query_input = {"text": q_sentence}
             query_image = str(row.get("query_image") or row.get("image") or row.get("image_url") or "").strip()
@@ -1399,8 +1454,34 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
                 kw_debug["qwen3vl_embedded_pool_size"] = len(qwen_filtered_item_ids)
                 kw_debug["merged_pool_size"] = len(top_ids)
+                qwen3vl_branch_top_ids = [
+                    qwen_filtered_item_ids[int(idx)]
+                    for idx in qwen3vl_rank_indices[: max(1, int(args.export_recall_branch_topk))]
+                ]
         else:
             kw_debug["qwen3vl_enabled"] = False
+        branch_export_root = Path(args.output_dir) / str(args.export_recall_branch_dir)
+        _export_branch_recall_bundle(
+            query=q_sentence,
+            user_id=user_id,
+            branch_name="text_embedding_recall",
+            ranked_item_ids=text_branch_top_ids,
+            meta_map=meta_map,
+            image_url_to_local=image_url_to_local,
+            export_root_dir=branch_export_root,
+            top_k=int(args.export_recall_branch_topk),
+        )
+        if qwen3vl_branch_top_ids:
+            _export_branch_recall_bundle(
+                query=q_sentence,
+                user_id=user_id,
+                branch_name="vl_embedding_recall",
+                ranked_item_ids=qwen3vl_branch_top_ids,
+                meta_map=meta_map,
+                image_url_to_local=image_url_to_local,
+                export_root_dir=branch_export_root,
+                top_k=int(args.export_recall_branch_topk),
+            )
         history_ids = list(
             dict.fromkeys(
                 x.strip() for x in str(row.get("remaining_interaction_string", "")).split("|") if x.strip()
@@ -1665,6 +1746,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="processed/beauty_unified_outputs")
     parser.add_argument("--export-topk-bundle-size", type=int, default=100, help="每个query导出最终排序Top-K条目的meta与图片副本。")
     parser.add_argument("--export-topk-bundle-dir", default="topk_rank_bundle", help="Top-K导出目录（相对output-dir）。")
+    parser.add_argument("--export-recall-branch-topk", type=int, default=50, help="导出text/vl embedding召回分支各自Top-K的meta与图片。")
+    parser.add_argument("--export-recall-branch-dir", default="recall_branch_bundle", help="召回分支Top-K导出目录（相对output-dir）。")
     parser.add_argument("--global-db", default="processed/beauty_global_item_features.db")
     parser.add_argument("--history-db", default="processed/beauty_user_history.db")
 
