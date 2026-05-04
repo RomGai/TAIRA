@@ -6,6 +6,7 @@ import glob
 import json
 import math
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -139,6 +140,61 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _sanitize_filename(text: str) -> str:
+    s = re.sub(r"[^\w\-.]+", "_", str(text or "").strip())
+    return s[:120] or "unknown"
+
+
+def _export_top_ranked_bundle(
+    ranking_output_path: Path,
+    bundle_dir: Path,
+    query: str,
+    meta_map: Dict[str, Dict[str, Any]],
+    image_url_to_local: Dict[str, str],
+    top_k: int = 100,
+) -> None:
+    if not ranking_output_path.exists():
+        return
+    try:
+        payload = json.loads(ranking_output_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[ExportTopK] skip invalid ranking file: {ranking_output_path}, error={exc}")
+        return
+    ranked_items = payload.get("ranked_items", [])
+    if not isinstance(ranked_items, list) or not ranked_items:
+        return
+
+    top_items: List[Dict[str, Any]] = []
+    images_dir = bundle_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    for rank_idx, ranked in enumerate(ranked_items[: max(1, int(top_k))], start=1):
+        item_id = str((ranked or {}).get("item_id", "")).strip()
+        if not item_id:
+            continue
+        meta = dict(meta_map.get(item_id, {}))
+        image_src = ""
+        if meta:
+            image_url = _safe_meta_image(meta)
+            image_src = image_url_to_local.get(image_url, "")
+            if image_src and Path(image_src).exists():
+                suffix = Path(image_src).suffix or ".jpg"
+                dst = images_dir / f"{rank_idx:03d}{suffix}"
+                try:
+                    shutil.copy2(image_src, dst)
+                    meta["copied_image_path"] = str(dst)
+                except Exception as exc:
+                    print(f"[ExportTopK] copy image failed rank={rank_idx} item={item_id} err={exc}")
+        top_items.append({"rank": rank_idx, "item_id": item_id, "meta": meta, "score": ranked.get("score", None)})
+
+    export_payload = {
+        "query": query,
+        "source_ranking_file": str(ranking_output_path),
+        "top_k": int(top_k),
+        "items": top_items,
+    }
+    _save_json(bundle_dir / "top_items_with_meta.json", export_payload)
 
 
 def _route_query(query: str, category_catalog: List[str], enable_llm: bool, text_model: str) -> Dict[str, Any]:
@@ -1531,6 +1587,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             module3_timing = getattr(module3_out, "timing", None)
             if isinstance(module3_timing, dict):
                 reranker_elapsed_sec = float(module3_timing.get("reranker_elapsed_sec", 0.0) or 0.0)
+            export_root = Path(args.output_dir) / str(args.export_topk_bundle_dir)
+            bundle_dir = export_root / f"user_{_sanitize_filename(user_id)}__row_{row_idx + 1:04d}"
+            _export_top_ranked_bundle(
+                ranking_output_path=existing_output,
+                bundle_dir=bundle_dir,
+                query=query,
+                meta_map=meta_map,
+                image_url_to_local=image_url_to_local,
+                top_k=int(args.export_topk_bundle_size),
+            )
         else:
             print("[Agent4/5] skipped by --disable-agent45")
         adaptive_pseudo_opt_elapsed_sec = adaptive_pseudo_opt_end_ts - adaptive_pseudo_opt_start_ts
@@ -1604,6 +1670,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--cache-dir", default="processed/beauty_cache")
     parser.add_argument("--output-dir", default="processed/beauty_unified_outputs")
+    parser.add_argument("--export-topk-bundle-size", type=int, default=100, help="每个query导出最终排序Top-K条目的meta与图片副本。")
+    parser.add_argument("--export-topk-bundle-dir", default="topk_rank_bundle", help="Top-K导出目录（相对output-dir）。")
     parser.add_argument("--global-db", default="processed/beauty_global_item_features.db")
     parser.add_argument("--history-db", default="processed/beauty_user_history.db")
 
