@@ -185,7 +185,7 @@ class Qwen3RouterLLM:
         )
 
     def rewrite_pseudo_query(self, real_query: str, history_item_info: Dict[str, Any]) -> str:
-        """Rewrite a pseudo query grounded on one history item while keeping query granularity."""
+        """Generate a history-grounded pseudo query using the real query as a style/reference example."""
         self.load()
         clean_query = str(real_query or "").strip()
         if not clean_query:
@@ -193,24 +193,18 @@ class Qwen3RouterLLM:
 
         history_item_json = json.dumps(history_item_info or {}, ensure_ascii=False)
         prompt = (
-            "You are an e-commerce retrieval query rewriting assistant.\n\n"
             "Task:\n"
-            "Given the current real query and the basic information of a history item,\n"
-            "generate one pseudo query that satisfies all constraints:\n"
-            "1) Keep the same information granularity as the real query (neither broader nor narrower).\n"
-            "2) Preserve semantic slot structure as much as possible (e.g., category/brand/specs/effects/"
-            "target people/style/scenario/budget).\n"
-            "3) The content must point to the history item and be supported by its title/category/attributes; no fabrication.\n"
-            "4) Do not output a long descriptive sentence; output a short search query as a user would type.\n"
-            "5) If some slots are missing in the real query, do not invent new slots in the pseudo query.\n"
-            "6) If the real query has hard constraints (brand/model/size/compatibility/people), map them only when evidence exists "
-            "in the history item; otherwise keep a weakened expression with the same granularity.\n"
-            "7) Output exactly one line pseudo query only. No explanation.\n\n"
+            "Use the example query as a reference style, then write a NEW query for this history item.\n"
+            "The output query should belong to the history item, not a rewrite/copy of the example query.\n\n"
+            "Guidance:\n"
+            "1) Treat the example query as style and granularity reference (how concise, what kind of slots), not fixed content.\n"
+            "2) If a slot from the example query has no evidence in the history item, you may omit or soften it.\n"
+            "3) Avoid fabrication; only use information supported by the history item.\n\n"
             "Input:\n"
-            f"Real query:\n{clean_query}\n\n"
+            f"Example query:\n{clean_query}\n\n"
             f"History item info (JSON):\n{history_item_json}\n\n"
             "Output:\n"
-            "<one-line pseudo query>"
+            "<one-line new query for the history item>"
         )
         messages = [{"role": "user", "content": prompt}]
         text = self._tokenizer.apply_chat_template(
@@ -249,7 +243,13 @@ class Qwen3RouterLLM:
                 kept_lines.append(normalized)
         if not kept_lines:
             return ""
-        return " ".join(kept_lines).strip()
+        merged = " ".join(kept_lines).strip()
+        payload = self._try_json_decode(merged)
+        if isinstance(payload, dict):
+            cand = str(payload.get("pseudo_query", "") or "").strip()
+            if cand:
+                merged = cand
+        return merged
 
     def optimize_modulation_params(
         self,

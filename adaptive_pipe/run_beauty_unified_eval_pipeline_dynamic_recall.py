@@ -249,16 +249,6 @@ def _rewrite_pseudo_query_with_llm(
     base = f"pseudo_query_from_history: {title}; {cat_text}; {desc}".strip(" ;")
     if llm is None:
         return {"text": base, "source": "fallback_no_llm", "error": "", "reasoning": "llm_disabled", "raw": ""}
-    prompt = (
-        "You are generating a retrieval pseudo query for a history item based on user's real query.\n"
-        "Goal: keep the pseudo query the same information granularity and expression style as user_query, not a product description.\n"
-        f"user_query: {user_query}\n"
-        f"history_item_id: {item_id}\n"
-        f"history_title: {title}\n"
-        f"history_category: {cat_text}\n"
-        f"history_description: {desc}\n"
-        "Output one short pseudo query only.\n"
-    )
 
     def _parse_json_like_agent4(text: str) -> Dict[str, Any] | None:
         decoder = json.JSONDecoder()
@@ -299,12 +289,15 @@ def _rewrite_pseudo_query_with_llm(
                     "title": title,
                     "category": cat_text,
                     "description": desc,
-                    "instruction": prompt,
                 },
             )
             or ""
         ).strip()
-        cleaned = _clean_pseudo_query_text(raw)
+        parsed = _parse_json_like_agent4(raw)
+        candidate = ""
+        if isinstance(parsed, dict):
+            candidate = str(parsed.get("pseudo_query", "") or "").strip()
+        cleaned = _clean_pseudo_query_text(candidate or raw)
         if cleaned:
             return {"text": cleaned, "source": "llm_rewrite_text", "error": "", "reasoning": "", "raw": raw}
         return {
