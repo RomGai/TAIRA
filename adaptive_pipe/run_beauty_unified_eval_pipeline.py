@@ -6,6 +6,7 @@ import glob
 import json
 import math
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -940,6 +941,60 @@ def _has_non_empty_ranked_items(output_path: Path) -> bool:
     return isinstance(ranked_items, list) and len(ranked_items) > 0
 
 
+def _save_topk_rank_bundle(
+    output_dir: str | Path,
+    user_id: str,
+    query: str,
+    ranked_items: List[Dict[str, Any]],
+    meta_map: Dict[str, Dict[str, Any]],
+    image_url_to_local: Dict[str, str] | None,
+    topk: int = 100,
+) -> None:
+    if not ranked_items:
+        return
+    top_items = ranked_items[: max(1, int(topk))]
+    bundle_dir = Path(output_dir) / "topk_rank_bundles" / f"user_{user_id}"
+    image_dir = bundle_dir / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    ordered_items: List[Dict[str, Any]] = []
+    for rank, row in enumerate(top_items, start=1):
+        item_id = str(row.get("item_id", "")).strip()
+        meta = dict(meta_map.get(item_id, {}))
+        image_url = str(meta.get("imUrl", "") or "").strip()
+        local_image_path = ""
+        copied_image_path = ""
+        if image_url and image_url_to_local:
+            local_image_path = str(image_url_to_local.get(image_url, "") or "").strip()
+        if not local_image_path and image_url and Path(image_url).exists():
+            local_image_path = image_url
+        if local_image_path:
+            src = Path(local_image_path)
+            if src.exists() and src.is_file():
+                suffix = src.suffix or ".jpg"
+                dst = image_dir / f"{rank:03d}{suffix}"
+                shutil.copy2(src, dst)
+                copied_image_path = str(dst)
+
+        ordered_items.append(
+            {
+                "rank": rank,
+                "item_id": item_id,
+                "meta": meta,
+                "copied_image_path": copied_image_path,
+            }
+        )
+
+    _save_json(
+        bundle_dir / "top100_items.json",
+        {
+            "user_id": str(user_id),
+            "query": str(query),
+            "topk": int(len(ordered_items)),
+            "items": ordered_items,
+        },
+    )
+
+
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     query_df = pd.read_csv(args.query_csv, dtype={"id": str, "user_id": str})
     if args.max_users > 0:
@@ -1069,6 +1124,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
         if _has_non_empty_ranked_items(existing_output):
             print(f"[UserLoop] skip user={user_id}: existing non-empty ranking output found at {existing_output}")
+            existing_payload = json.loads(existing_output.read_text(encoding="utf-8"))
+            _save_topk_rank_bundle(
+                output_dir=args.output_dir,
+                user_id=user_id,
+                query=str(existing_payload.get("query", query)),
+                ranked_items=existing_payload.get("ranked_items", []) if isinstance(existing_payload, dict) else [],
+                meta_map=meta_map,
+                image_url_to_local=image_url_to_local if "image_url_to_local" in locals() else None,
+                topk=100,
+            )
             _print_dynamic_output_metrics(args.output_dir)
             continue
         if existing_output.exists():
@@ -1366,6 +1431,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 collaborative_max_items=int(args.collaborative_max_items),
             )
             ranked_first = module3_out.ranked_items[0]["item_id"] if module3_out.ranked_items else ""
+            _save_topk_rank_bundle(
+                output_dir=args.output_dir,
+                user_id=user_id,
+                query=q_sentence,
+                ranked_items=module3_out.ranked_items,
+                meta_map=meta_map,
+                image_url_to_local=image_url_to_local if "image_url_to_local" in locals() else None,
+                topk=100,
+            )
         else:
             print("[Agent4/5] skipped by --disable-agent45")
 
