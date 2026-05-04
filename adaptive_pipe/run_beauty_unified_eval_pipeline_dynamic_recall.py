@@ -1185,6 +1185,39 @@ def _write_recall_failed_zero_output(output_path: Path, user_id: str, query: str
     _save_json(output_path, payload)
 
 
+def _write_agent3_recall_topk_output(
+    output_path: Path,
+    user_id: str,
+    query: str,
+    target_id: str,
+    top_ids: List[str],
+    recall_hit: int,
+) -> None:
+    ranked_items = [
+        {
+            "rank": idx,
+            "item_id": str(iid),
+            "score": float(max(0.0, 1.0 - ((idx - 1) / max(1, len(top_ids))))),
+        }
+        for idx, iid in enumerate(top_ids, start=1)
+    ]
+    payload = {
+        "user_id": str(user_id),
+        "query": str(query),
+        "preference_constraints": {
+            "Must_Have": [],
+            "Nice_to_Have": [],
+            "Must_Avoid": [],
+            "Predicted_Next_Items": [],
+            "Reasoning": "agent3_recall_only_output",
+        },
+        "ranked_items": ranked_items,
+        "groundtruth_target_item_id": str(target_id),
+        "agent3_recall_hit": int(recall_hit),
+    }
+    _save_json(output_path, payload)
+
+
 def _has_non_empty_ranked_items(output_path: Path) -> bool:
     if not output_path.exists():
         return False
@@ -1565,12 +1598,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         hit = target_id in top_ids
         if not hit:
-            print("[Agent3] recall failed. metric=0, skip Agent1/2/4/5")
-            _write_recall_failed_zero_output(
+            print("[Agent3] recall failed. save Agent3 recall top-k output, skip Agent1/2/4/5")
+            _write_agent3_recall_topk_output(
                 output_path=existing_output,
                 user_id=user_id,
                 query=q_sentence,
                 target_id=target_id,
+                top_ids=top_ids,
+                recall_hit=0,
             )
             results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
             _print_dynamic_output_metrics(args.output_dir)
