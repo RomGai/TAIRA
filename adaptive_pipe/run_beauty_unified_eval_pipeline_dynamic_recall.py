@@ -1611,6 +1611,20 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             _print_dynamic_output_metrics(args.output_dir)
             continue
 
+        if bool(getattr(args, "recall_only", False)):
+            print(f"[Agent3] recall hit at k={used_k}; recall-only mode enabled, skip Agent1/2/4/5")
+            _write_agent3_recall_topk_output(
+                output_path=existing_output,
+                user_id=user_id,
+                query=q_sentence,
+                target_id=target_id,
+                top_ids=top_ids,
+                recall_hit=1,
+            )
+            results.append({"user_id": user_id, "target_id": target_id, "hit": 1, "used_k": used_k, "kw_debug": kw_debug})
+            _print_dynamic_output_metrics(args.output_dir)
+            continue
+
         print(f"[Agent3] recall hit at k={used_k}; run Agent1/2")
         adaptive_to_downstream_pre_agent12_ts = time.perf_counter()
         candidate_items: List[Dict[str, Any]] = []
@@ -1791,6 +1805,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-llm-routing", action="store_true", help="开启Qwen3文本路由；默认关闭走规则fallback")
     parser.add_argument("--enable-vl-profiling", action="store_true", help="开启Qwen3-VL画像；默认关闭走轻量画像")
     parser.add_argument("--disable-agent45", action="store_true", help="关闭Agent4/5")
+    parser.add_argument("--recall-only", action="store_true", help="仅执行Agent3召回并输出召回Top-K，不运行Agent1/2/4/5。")
     parser.add_argument("--enable-collaborative-signal", action="store_true", help="开启Agent4协同信号：基于Reasoning embedding检索相似用户并扩充Agent5候选池")
     parser.add_argument("--collaborative-similarity-threshold", type=float, default=0.5, help="协同信号相似用户阈值（cosine）")
     parser.add_argument("--collaborative-db-path", default="processed/beauty_collaborative_signal.db", help="协同信号SQLite存储路径")
