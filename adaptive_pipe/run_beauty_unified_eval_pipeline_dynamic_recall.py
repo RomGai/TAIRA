@@ -595,7 +595,14 @@ def _repair_qwen3vl_cache_for_missing_ids(
             cache_map[iid] = cached_matrix[idx]
 
     new_emb = np.concatenate(missing_embs, axis=0)
-    for idx, iid in enumerate(embedded_ids):
+    aligned_new = min(len(embedded_ids), int(new_emb.shape[0]))
+    if aligned_new < len(embedded_ids):
+        dropped = len(embedded_ids) - aligned_new
+        print(
+            f"[Agent3][Qwen3VL][repair] warning: embedded_ids={len(embedded_ids)} "
+            f"but emb_rows={new_emb.shape[0]}; drop_tail_ids={dropped}."
+        )
+    for idx, iid in enumerate(embedded_ids[:aligned_new]):
         cache_map[iid] = new_emb[idx]
 
     repaired_ids: List[str] = []
@@ -1185,6 +1192,39 @@ def _write_recall_failed_zero_output(output_path: Path, user_id: str, query: str
     _save_json(output_path, payload)
 
 
+def _write_agent3_recall_topk_output(
+    output_path: Path,
+    user_id: str,
+    query: str,
+    target_id: str,
+    top_ids: List[str],
+    recall_hit: int,
+) -> None:
+    ranked_items = [
+        {
+            "rank": idx,
+            "item_id": str(iid),
+            "score": float(max(0.0, 1.0 - ((idx - 1) / max(1, len(top_ids))))),
+        }
+        for idx, iid in enumerate(top_ids, start=1)
+    ]
+    payload = {
+        "user_id": str(user_id),
+        "query": str(query),
+        "preference_constraints": {
+            "Must_Have": [],
+            "Nice_to_Have": [],
+            "Must_Avoid": [],
+            "Predicted_Next_Items": [],
+            "Reasoning": "agent3_recall_only_output",
+        },
+        "ranked_items": ranked_items,
+        "groundtruth_target_item_id": str(target_id),
+        "agent3_recall_hit": int(recall_hit),
+    }
+    _save_json(output_path, payload)
+
+
 def _has_non_empty_ranked_items(output_path: Path) -> bool:
     if not output_path.exists():
         return False
@@ -1273,16 +1313,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 q_item_ids_cached, q_item_emb_matrix, "Qwen3VL"
             )
             if q_item_emb_matrix is not None:
-                q_item_ids_cached, q_item_emb_matrix = _repair_qwen3vl_cache_for_missing_ids(
-                    qwen3vl_model=qwen3vl_model,
-                    cache_path=qwen3vl_emb_cache_path,
-                    all_item_ids=all_item_ids,
-                    cached_ids=q_item_ids_cached,
-                    cached_matrix=q_item_emb_matrix,
-                    meta_map=meta_map,
-                    image_url_to_local=image_url_to_local,
-                    chunk_size=max(1, int(args.agent3_qwen3vl_chunk_size)),
-                )
+                if bool(getattr(args, "skip_agent3_qwen3vl_cache_repair", False)):
+                    print("[Agent3][Qwen3VL] skip cache repair by flag; use cached subset directly.")
+                else:
+                    q_item_ids_cached, q_item_emb_matrix = _repair_qwen3vl_cache_for_missing_ids(
+                        qwen3vl_model=qwen3vl_model,
+                        cache_path=qwen3vl_emb_cache_path,
+                        all_item_ids=all_item_ids,
+                        cached_ids=q_item_ids_cached,
+                        cached_matrix=q_item_emb_matrix,
+                        meta_map=meta_map,
+                        image_url_to_local=image_url_to_local,
+                        chunk_size=max(1, int(args.agent3_qwen3vl_chunk_size)),
+                    )
         if q_item_emb_matrix is None:
             q_item_emb_matrix = _build_qwen3vl_item_embedding_cache(
                 qwen3vl_model=qwen3vl_model,
@@ -1565,14 +1608,30 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         hit = target_id in top_ids
         if not hit:
-            print("[Agent3] recall failed. metric=0, skip Agent1/2/4/5")
-            _write_recall_failed_zero_output(
+            print("[Agent3] recall failed. save Agent3 recall top-k output, skip Agent1/2/4/5")
+            _write_agent3_recall_topk_output(
                 output_path=existing_output,
                 user_id=user_id,
                 query=q_sentence,
                 target_id=target_id,
+                top_ids=top_ids,
+                recall_hit=0,
             )
             results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k, "kw_debug": kw_debug})
+            _print_dynamic_output_metrics(args.output_dir)
+            continue
+
+        if bool(getattr(args, "recall_only", False)):
+            print(f"[Agent3] recall hit at k={used_k}; recall-only mode enabled, skip Agent1/2/4/5")
+            _write_agent3_recall_topk_output(
+                output_path=existing_output,
+                user_id=user_id,
+                query=q_sentence,
+                target_id=target_id,
+                top_ids=top_ids,
+                recall_hit=1,
+            )
+            results.append({"user_id": user_id, "target_id": target_id, "hit": 1, "used_k": used_k, "kw_debug": kw_debug})
             _print_dynamic_output_metrics(args.output_dir)
             continue
 
@@ -1724,6 +1783,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent3-qwen3vl-max-pixels", type=int, default=1048576, help="Qwen3-VL输入图最大像素约束；过大图片会被压到该预算。")
     parser.add_argument("--agent3-qwen3vl-chunk-size", type=int, default=100, help="Qwen3-VL多模态embedding建库分块大小（默认100）。")
     parser.add_argument("--agent3-qwen3vl-save-every", type=int, default=1000, help="Qwen3-VL embedding每累计多少条落盘一次part文件，最后再合并。")
+    parser.add_argument("--skip-agent3-qwen3vl-cache-repair", action="store_true", help="跳过Qwen3-VL cache缺失ID修复，直接使用已有embedding子集做检索。")
     parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
     parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
     parser.add_argument("--enable-agent3-adaptive-weighting", action="store_true", help="开启Agent3基于历史伪查询的text/vl自适应权重迭代。")
@@ -1756,6 +1816,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-llm-routing", action="store_true", help="开启Qwen3文本路由；默认关闭走规则fallback")
     parser.add_argument("--enable-vl-profiling", action="store_true", help="开启Qwen3-VL画像；默认关闭走轻量画像")
     parser.add_argument("--disable-agent45", action="store_true", help="关闭Agent4/5")
+    parser.add_argument("--recall-only", action="store_true", help="仅执行Agent3召回并输出召回Top-K，不运行Agent1/2/4/5。")
     parser.add_argument("--enable-collaborative-signal", action="store_true", help="开启Agent4协同信号：基于Reasoning embedding检索相似用户并扩充Agent5候选池")
     parser.add_argument("--collaborative-similarity-threshold", type=float, default=0.5, help="协同信号相似用户阈值（cosine）")
     parser.add_argument("--collaborative-db-path", default="processed/beauty_collaborative_signal.db", help="协同信号SQLite存储路径")
